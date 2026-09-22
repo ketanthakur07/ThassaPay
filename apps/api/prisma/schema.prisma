@@ -1,0 +1,191 @@
+// ThassaPay — Prisma schema (v2)
+// Money is stored as BigInt paise. Never store currency as Float/Decimal-in-app-math.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum PaymentStatus {
+  INITIATED
+  AWAITING_CONFIRMATION
+  SUCCESS
+  FAILED
+  NEEDS_REVIEW
+  CANCELLED
+}
+
+enum PaymentMethod {
+  UPI
+  CASH
+  CARD
+  OTHER
+}
+
+enum ExpenseSource {
+  MANUAL
+  UPI
+}
+
+model College {
+  id        String   @id @default(uuid())
+  name      String
+  domain    String   @unique // e.g. vitap.ac.in — used to restrict signup
+  createdAt DateTime @default(now())
+
+  users User[]
+
+  @@map("colleges")
+}
+
+model User {
+  id           String   @id @default(uuid())
+  collegeId    String
+  college      College  @relation(fields: [collegeId], references: [id])
+  name         String
+  email        String   @unique
+  phone        String?
+  hostelBlock  String?
+  roomNo       String?
+  googleSub    String   @unique // Google OAuth subject id, not a password
+  refreshTokenHash String? // hashed, rotated on every use
+  createdAt    DateTime @default(now())
+  deletedAt    DateTime? // soft delete — never hard-delete a user with financial history
+
+  budgets         Budget[]
+  expenses        Expense[]
+  paymentAttempts PaymentAttempt[]
+  upiPayees       UpiPayee[]
+  auditLogs       AuditLog[]
+
+  @@index([collegeId])
+  @@map("users")
+}
+
+model Category {
+  id        String   @id @default(uuid())
+  name      String
+  icon      String?
+  isDefault Boolean  @default(false)
+
+  expenses Expense[]
+
+  @@map("categories")
+}
+
+model Budget {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  month     String   // "2026-09" — simple, sortable, unambiguous
+  amountPaise BigInt
+  createdAt DateTime @default(now())
+
+  @@unique([userId, month])
+  @@map("budgets")
+}
+
+// A payment attempt is NOT an expense. Only a SUCCESS attempt produces one.
+model PaymentAttempt {
+  id             String        @id @default(uuid())
+  userId         String
+  user           User          @relation(fields: [userId], references: [id])
+  idempotencyKey String        @unique // client-generated, prevents duplicate attempts
+  amountPaise    BigInt
+  upiId          String
+  referenceId    String?       // reference returned by the UPI app / PSP, if any
+  status         PaymentStatus @default(INITIATED)
+  initiatedAt    DateTime      @default(now())
+  awaitingSince  DateTime?     // when it moved to AWAITING_CONFIRMATION — drives the sweep job
+  completedAt    DateTime?
+  failureReason  String?
+
+  events  PaymentEvent[]
+  expense Expense?
+
+  @@index([userId, status])
+  @@index([status, awaitingSince]) // used by the reconciliation sweep
+  @@map("payment_attempts")
+}
+
+// Append-only. Never updated or deleted — this is the source of truth for "what happened".
+model PaymentEvent {
+  id               String        @id @default(uuid())
+  paymentAttemptId String
+  paymentAttempt   PaymentAttempt @relation(fields: [paymentAttemptId], references: [id])
+  fromStatus       PaymentStatus?
+  toStatus         PaymentStatus
+  reason           String?       // "user_confirmed" | "sweep_timeout" | "app_callback" | ...
+  createdAt        DateTime      @default(now())
+
+  @@index([paymentAttemptId])
+  @@map("payment_events")
+}
+
+model Expense {
+  id               String         @id @default(uuid())
+  userId           String
+  user             User           @relation(fields: [userId], references: [id])
+  categoryId       String
+  category         Category       @relation(fields: [categoryId], references: [id])
+  amountPaise      BigInt
+  paymentMethod    PaymentMethod
+  source           ExpenseSource
+  description      String?
+  expenseDate      DateTime
+  paymentAttemptId String?        @unique // only set when source = UPI
+  paymentAttempt   PaymentAttempt? @relation(fields: [paymentAttemptId], references: [id])
+  correctedFromId  String?        // points to the original expense this one corrects
+  createdAt        DateTime       @default(now())
+  deletedAt        DateTime?      // soft delete — corrections/audits need history intact
+
+  receipts Receipt[]
+
+  @@index([userId, expenseDate])
+  @@index([userId, categoryId])
+  @@map("expenses")
+}
+
+model UpiPayee {
+  id         String   @id @default(uuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id])
+  name       String
+  upiId      String
+  categoryId String?
+  isFavorite Boolean  @default(false)
+
+  @@index([userId])
+  @@map("upi_payees")
+}
+
+model Receipt {
+  id        String   @id @default(uuid())
+  expenseId String
+  expense   Expense  @relation(fields: [expenseId], references: [id])
+  fileUrl   String
+  createdAt DateTime @default(now())
+
+  @@map("receipts")
+}
+
+// Immutable at the DB-role level (app's Postgres role should have INSERT/SELECT only
+// on this table — no UPDATE/DELETE grants). Records admin/security-relevant actions.
+model AuditLog {
+  id         String   @id @default(uuid())
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id])
+  actorType  String   // "user" | "admin" | "system"
+  action     String   // "expense.corrected" | "admin.budget_override" | ...
+  targetType String?
+  targetId   String?
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  @@index([userId])
+  @@map("audit_logs")
+}

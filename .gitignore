@@ -1,0 +1,44 @@
+# ThassaPay Dependencies
+node_modules/
+dist/
+build/
+.expo/
+*.local
+
+# Environment — NEVER commit .env files
+.env
+.env.*
+!.env.example
+
+# Prisma
+prisma/migrations/dev.db
+
+# Editor
+.vscode/
+.idea/
+*.suo
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Test artifacts
+coverage/
+.nyc_output/
+
+# Mobile
+*.jks
+*.keystore
+*.mobileprovision
+*.p8
+*.p12
+*.cer
+
+# Build preview
+backend-preview/
+*.zip
