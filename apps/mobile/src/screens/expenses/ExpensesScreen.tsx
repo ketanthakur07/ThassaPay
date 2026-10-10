@@ -11,17 +11,17 @@ import {
   Alert,
 } from 'react-native';
 import { colors } from '../../theme/colors';
-import { apiClient } from '../../services/api/apiClient';
+import { apiClient, ExpenseRecord } from '../../services/api/apiClient';
 import { ExpenseCard } from '../../components/ExpenseCard';
 import { Money } from '@thassapay/money';
 
 export const ExpensesScreen: React.FC = () => {
-  const [expenses, setExpenses] = useState<any[]>([]);
-  const [categories, setCategories] = useState<any[]>([]);
+  const [expenses, setExpenses] = useState<ExpenseRecord[]>([]);
+  const [categories, setCategories] = useState<Array<{ id: string; name: string; icon: string; isDefault: boolean }>>([]);
   const [selectedCategory, setSelectedCategory] = useState<string>('ALL');
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
-  const [selectedExpense, setSelectedExpense] = useState<any | null>(null);
+  const [selectedExpense, setSelectedExpense] = useState<ExpenseRecord | null>(null);
 
   useEffect(() => {
     loadData();
@@ -51,8 +51,8 @@ export const ExpensesScreen: React.FC = () => {
       await apiClient.expenses.delete(id);
       setSelectedExpense(null);
       loadData();
-    } catch (err: any) {
-      Alert.alert('Error', err.message || 'Failed to delete expense');
+    } catch (err: unknown) {
+      Alert.alert('Error', err instanceof Error ? err.message : 'Failed to delete expense');
     }
   };
 

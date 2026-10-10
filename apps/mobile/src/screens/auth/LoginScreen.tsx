@@ -38,8 +38,8 @@ export const LoginScreen: React.FC = () => {
         setDevOtpHint(res.devOtp);
       }
       setStep('otp');
-    } catch (err: any) {
-      setErrorMessage(err.message || 'Failed to request OTP');
+    } catch (err: unknown) {
+      setErrorMessage(err instanceof Error ? err.message : 'Failed to request OTP');
     } finally {
       setIsLoading(false);
     }
@@ -55,8 +55,8 @@ export const LoginScreen: React.FC = () => {
     setIsLoading(true);
     try {
       await verifyOtp(phoneNumber, otp);
-    } catch (err: any) {
-      setErrorMessage(err.message || 'Invalid or expired OTP');
+    } catch (err: unknown) {
+      setErrorMessage(err instanceof Error ? err.message : 'Invalid or expired OTP');
     } finally {
       setIsLoading(false);
     }

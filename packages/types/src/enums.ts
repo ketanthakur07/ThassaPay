@@ -18,13 +18,24 @@ export enum TransactionType {
   CREDIT = 'CREDIT',
 }
 
+/**
+ * Source of truth: apps/api/prisma/schema.prisma (`enum PaymentStatus`).
+ *
+ * Audit fix (P0): this shared enum was still the v1 list
+ * (PENDING_VERIFICATION / CONFIRMED / EXPIRED / DISPUTED) while the API and
+ * the migration create INITIATED / AWAITING_CONFIRMATION / SUCCESS /
+ * FAILED / NEEDS_REVIEW / CANCELLED. Every status comparison in the mobile
+ * app compiled against values the server can never send, and the app's
+ * typecheck failed. Keep this in lockstep with the Prisma schema — a drift
+ * here silently breaks the API <-> mobile contract on both sides.
+ */
 export enum PaymentStatus {
   INITIATED = 'INITIATED',
-  PENDING_VERIFICATION = 'PENDING_VERIFICATION',
-  CONFIRMED = 'CONFIRMED',
+  AWAITING_CONFIRMATION = 'AWAITING_CONFIRMATION',
+  SUCCESS = 'SUCCESS',
   FAILED = 'FAILED',
-  EXPIRED = 'EXPIRED',
-  DISPUTED = 'DISPUTED',
+  NEEDS_REVIEW = 'NEEDS_REVIEW',
+  CANCELLED = 'CANCELLED',
 }
 
 export enum UPIIntentApp {

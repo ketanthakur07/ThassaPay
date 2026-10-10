@@ -52,8 +52,8 @@ export const OnboardingScreen: React.FC = () => {
         budgetRupees: budget,
         roastTone,
       });
-    } catch (err: any) {
-      setError(err.message || 'Failed to complete profile setup');
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Failed to complete profile setup');
     } finally {
       setIsLoading(false);
     }

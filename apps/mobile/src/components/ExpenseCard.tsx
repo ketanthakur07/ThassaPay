@@ -9,7 +9,7 @@ interface ExpenseCardProps {
   categoryName: string;
   categoryIcon?: string;
   paymentMethod: string;
-  description?: string;
+  description?: string | null;
   expenseDate: string;
   isDeleted?: boolean;
   onPress?: () => void;

@@ -22,7 +22,7 @@ interface AddExpenseScreenProps {
 
 export const AddExpenseScreen: React.FC<AddExpenseScreenProps> = ({ onSuccess, onCancel }) => {
   const [rupeesInput, setRupeesInput] = useState('');
-  const [categories, setCategories] = useState<any[]>([]);
+  const [categories, setCategories] = useState<Array<{ id: string; name: string; icon: string; isDefault: boolean }>>([]);
   const [selectedCategoryId, setSelectedCategoryId] = useState('');
   const [paymentMethod, setPaymentMethod] = useState<'UPI' | 'CASH' | 'CARD' | 'OTHER'>('UPI');
   const [description, setDescription] = useState('');
@@ -111,8 +111,8 @@ export const AddExpenseScreen: React.FC<AddExpenseScreenProps> = ({ onSuccess, o
         intensity: roast.intensity,
         damageScore: roast.damageScore,
       });
-    } catch (err: any) {
-      setError(err.message || 'Failed to record expense');
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Failed to record expense');
     } finally {
       setIsLoading(false);
     }

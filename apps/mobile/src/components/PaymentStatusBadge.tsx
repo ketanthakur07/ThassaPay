@@ -9,18 +9,25 @@ interface PaymentStatusBadgeProps {
 
 export const PaymentStatusBadge: React.FC<PaymentStatusBadgeProps> = ({ status }) => {
   const getBadgeConfig = () => {
+    // Values come from the server's PaymentStatus (see packages/types).
     switch (status) {
-      case PaymentStatus.CONFIRMED:
+      case PaymentStatus.SUCCESS:
       case 'SUCCESS':
         return { label: 'CONFIRMED', color: colors.statusSuccess, bg: 'rgba(46, 213, 115, 0.15)' };
-      case PaymentStatus.PENDING_VERIFICATION:
+      case PaymentStatus.AWAITING_CONFIRMATION:
       case 'AWAITING_CONFIRMATION':
         return { label: 'AWAITING CONFIRMATION', color: colors.statusInitiated, bg: 'rgba(255, 165, 2, 0.15)' };
+      case PaymentStatus.NEEDS_REVIEW:
       case 'NEEDS_REVIEW':
         return { label: 'NEEDS REVIEW', color: colors.statusReview, bg: 'rgba(224, 86, 253, 0.15)' };
       case PaymentStatus.FAILED:
       case 'FAILED':
         return { label: 'FAILED', color: colors.statusFailed, bg: 'rgba(255, 71, 87, 0.15)' };
+      case PaymentStatus.CANCELLED:
+      case 'CANCELLED':
+        return { label: 'CANCELLED', color: colors.statusFailed, bg: 'rgba(255, 71, 87, 0.10)' };
+      case PaymentStatus.INITIATED:
+      case 'INITIATED':
       default:
         return { label: 'INITIATED', color: colors.brandBlue, bg: 'rgba(30, 144, 255, 0.15)' };
     }

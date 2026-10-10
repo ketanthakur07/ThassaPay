@@ -61,8 +61,8 @@ export const ProfileScreen: React.FC = () => {
 
       setSuccessMsg('Profile & roast settings updated!');
       setTimeout(() => setSuccessMsg(''), 3000);
-    } catch (err: any) {
-      Alert.alert('Error', err.message || 'Failed to update settings');
+    } catch (err: unknown) {
+      Alert.alert('Error', err instanceof Error ? err.message : 'Failed to update settings');
     } finally {
       setIsSaving(false);
     }

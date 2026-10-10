@@ -10,7 +10,7 @@ import {
 } from 'react-native';
 import { colors } from '../../theme/colors';
 import { useAuth } from '../../state/AuthContext';
-import { apiClient } from '../../services/api/apiClient';
+import { apiClient, ExpenseRecord } from '../../services/api/apiClient';
 import { DamageMeter } from '../../components/DamageMeter';
 import { RoastCard } from '../../components/RoastCard';
 import { ExpenseCard } from '../../components/ExpenseCard';
@@ -48,7 +48,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     categoryBreakdown: [],
   });
 
-  const [recentExpenses, setRecentExpenses] = useState<any[]>([]);
+  const [recentExpenses, setRecentExpenses] = useState<ExpenseRecord[]>([]);
   const [currentRoast, setCurrentRoast] = useState<{
     roastText: string;
     toneUsed: RoastTone;

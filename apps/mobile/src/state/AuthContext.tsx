@@ -7,9 +7,10 @@ interface AuthUser {
   id: string;
   name: string;
   email: string;
-  phone?: string;
-  hostelBlock?: string;
-  roomNo?: string;
+  // The API returns null for unset optional columns, never `undefined`.
+  phone?: string | null;
+  hostelBlock?: string | null;
+  roomNo?: string | null;
   preferredRoastTone?: RoastTone;
 }
 

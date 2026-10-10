@@ -23,7 +23,7 @@ interface PayScreenProps {
 export const PayScreen: React.FC<PayScreenProps> = ({ onPaymentInitiated, onCancel }) => {
   const [rupeesInput, setRupeesInput] = useState('');
   const [upiId, setUpiId] = useState('');
-  const [categories, setCategories] = useState<any[]>([]);
+  const [categories, setCategories] = useState<Array<{ id: string; name: string; icon: string; isDefault: boolean }>>([]);
   const [selectedCategoryId, setSelectedCategoryId] = useState('');
   const [note, setNote] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -84,34 +84,45 @@ export const PayScreen: React.FC<PayScreenProps> = ({ onPaymentInitiated, onCanc
       // Generate client idempotency key
       const idempotencyKey = `pay_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 
-      // 3. Create backend PaymentAttempt (state machine: INITIATED)
-      const paymentAttempt = await apiClient.payments.create({
+      // 3. Create backend PaymentAttempt (state machine: INITIATED).
+      // Audit fix (P0): the backend expects amount as a rupee STRING (it parses
+      // via @thassapay/money) plus categoryId; the old payload sent amountPaise
+      // + a referenceId field the backend rejected, so initiation always 400ed.
+      await apiClient.payments.create({
         upiId: upiId.trim(),
-        amountPaise,
+        amount: rupeesInput.trim(),
         idempotencyKey,
-        referenceId: note.trim() || undefined,
+        categoryId: selectedCategoryId,
+        description: note.trim() || undefined,
+      }).then((paymentAttempt) => {
+        // 4. Construct UPI URI (backend does not build one — VPA is the source)
+        const upiUrl =
+          `upi://pay?pa=${encodeURIComponent(upiId.trim())}&pn=${encodeURIComponent('Merchant')}&am=${money.toRupees().toFixed(2)}&cu=INR&tn=${encodeURIComponent(note || 'ThassaPay')}`;
+
+        Linking.canOpenURL(upiUrl)
+          .catch(() => false)
+          .then((supported) => {
+            if (supported) {
+              Linking.openURL(upiUrl).catch(() => {
+                // In simulator or environments without native UPI apps
+                Alert.alert(
+                  'UPI App Not Found',
+                  'No external UPI app could be opened on this device simulator. Simulating payment return...',
+                );
+              });
+            } else {
+              Alert.alert(
+                'UPI App Not Found',
+                'No UPI app is installed. You can still complete verification when you return.',
+              );
+            }
+          });
+
+        // Notify return to payment state machine verification screen
+        onPaymentInitiated(paymentAttempt.id, selectedCategoryId, amountPaise);
       });
-
-      // 4. Construct or use UPI URI
-      // e.g. upi://pay?pa=...&pn=...&am=...&cu=INR&tn=...
-      const upiUrl = paymentAttempt.upiUri ||
-        `upi://pay?pa=${encodeURIComponent(upiId.trim())}&pn=${encodeURIComponent('Merchant')}&am=${money.toRupees().toFixed(2)}&cu=INR&tn=${encodeURIComponent(note || 'ThassaPay')}`;
-
-      const supported = await Linking.canOpenURL(upiUrl).catch(() => true);
-      if (supported) {
-        await Linking.openURL(upiUrl).catch(() => {
-          // In simulator or environments without native UPI apps
-          Alert.alert(
-            'UPI App Not Found',
-            'No external UPI app could be opened on this device simulator. Simulating payment return...',
-          );
-        });
-      }
-
-      // Notify return to payment state machine verification screen
-      onPaymentInitiated(paymentAttempt.id, selectedCategoryId, amountPaise);
-    } catch (err: any) {
-      setError(err.message || 'Failed to initiate UPI payment');
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Failed to initiate UPI payment');
     } finally {
       setIsLoading(false);
     }

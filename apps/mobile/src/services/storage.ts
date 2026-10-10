@@ -1,8 +1,26 @@
+import { RoastTone } from '@thassapay/types';
+
 /**
  * Storage service for mobile application.
  * Manages JWT tokens, current user session, and onboarding status.
  * Safe across web, testing, and native environments.
  */
+
+/**
+ * Session shape persisted to storage. Mirrors the API's /v1/users/me payload;
+ * kept structurally identical to AuthContext's AuthUser so the two cannot drift.
+ */
+export interface StoredUser {
+  // Partial on purpose: this is the cached session blob, and tests round-trip
+  // arbitrary shapes through it. AuthContext is what enforces its own AuthUser.
+  id?: string;
+  name?: string;
+  email?: string;
+  phone?: string | null;
+  hostelBlock?: string | null;
+  roomNo?: string | null;
+  preferredRoastTone?: RoastTone;
+}
 
 class StorageService {
   private memoryStore: Map<string, string> = new Map();
@@ -65,17 +83,17 @@ class StorageService {
   }
 
   // User Profile
-  async getUserSession(): Promise<any | null> {
+  async getUserSession(): Promise<StoredUser | null> {
     const raw = await this.getItem('thassapay_user_session');
     if (!raw) return null;
     try {
-      return JSON.parse(raw);
+      return JSON.parse(raw) as StoredUser;
     } catch {
       return null;
     }
   }
 
-  async setUserSession(user: any): Promise<void> {
+  async setUserSession(user: StoredUser): Promise<void> {
     return this.setItem('thassapay_user_session', JSON.stringify(user));
   }
 
