@@ -1,0 +1,7 @@
+# Local audit override: host port 6379 is occupied by an unrelated container
+# (cyvrix-dev-redis), so ThassaPay Redis is exposed on 6390 instead.
+# REDIS_URL in apps/api/.env must match (redis://localhost:6390).
+services:
+  redis:
+    ports: !override
+      - '6390:6379'

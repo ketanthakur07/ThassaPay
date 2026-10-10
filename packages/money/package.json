@@ -9,7 +9,7 @@
     "build": "tsc",
     "test": "jest",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint src --ext .ts"
+    "lint": "eslint src"
   },
   "devDependencies": {
     "@types/jest": "^29.5.13",

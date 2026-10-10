@@ -8,7 +8,8 @@
   "scripts": {
     "build": "tsc",
     "test": "jest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src"
   },
   "dependencies": {
     "@thassapay/types": "*",
@@ -23,6 +24,8 @@
   "jest": {
     "preset": "ts-jest",
     "testEnvironment": "node",
-    "testMatch": ["**/*.spec.ts"]
+    "testMatch": [
+      "**/*.spec.ts"
+    ]
   }
 }

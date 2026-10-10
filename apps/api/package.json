@@ -4,6 +4,8 @@
   "private": true,
   "scripts": {
     "build": "nest build",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
+    "lint": "eslint src test",
     "start:dev": "nest start --watch",
     "start:prod": "node dist/main",
     "test": "jest",
