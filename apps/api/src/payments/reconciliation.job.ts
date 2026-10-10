@@ -32,20 +32,29 @@ export class ReconciliationJob {
 
     for (const attempt of stale) {
       assertValidTransition(attempt.status, PaymentStatus.NEEDS_REVIEW);
-      await this.prisma.$transaction([
-        this.prisma.paymentAttempt.update({
-          where: { id: attempt.id },
+      // Audit fix (P1): the job must be idempotent when it runs twice (overlapping
+      // sweeps, two API replicas, a retry after a crash). The WHERE clause pins
+      // the status we read: if another sweep — or a user confirmation — already
+      // moved the attempt, count is 0 and we write nothing, so no duplicate
+      // payment_event row is ever appended. It can never create an expense:
+      // this job does not touch Expense at all.
+      await this.prisma.$transaction(async (tx) => {
+        const updated = await tx.paymentAttempt.updateMany({
+          where: { id: attempt.id, status: PaymentStatus.AWAITING_CONFIRMATION },
           data: { status: PaymentStatus.NEEDS_REVIEW },
-        }),
-        this.prisma.paymentEvent.create({
+        });
+        if (updated.count === 0) {
+          return; // already handled elsewhere — do not double-log
+        }
+        await tx.paymentEvent.create({
           data: {
             paymentAttemptId: attempt.id,
             fromStatus: attempt.status,
             toStatus: PaymentStatus.NEEDS_REVIEW,
             reason: 'sweep_timeout',
           },
-        }),
-      ]);
+        });
+      });
 
       // TODO: push a notification via the (separate) notifications module —
       // "Did your ₹X payment to <upiId> go through?" — intentionally not wired

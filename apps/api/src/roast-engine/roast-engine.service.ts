@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 import { RoastTone, RoastIntensity } from '@thassapay/types';
 
 export interface GenerateRoastInput {
@@ -7,6 +7,18 @@ export interface GenerateRoastInput {
   monthlySpendPaise: number;
   monthlyBudgetPaise?: number;
   tone?: RoastTone;
+}
+
+/**
+ * Audit fix (P0): the controller passes raw client JSON straight in, so a
+ * missing/garbage amountPaise produced "₹NaN spent." roasts. The roast engine
+ * is cosmetic, but it still must never emit nonsense about money.
+ */
+function assertFiniteNumber(value: unknown, field: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new BadRequestException(`${field} must be a finite number`);
+  }
+  return value;
 }
 
 const ROAST_TEMPLATES: Record<string, Record<RoastTone, string[]>> = {
@@ -69,8 +81,15 @@ const ROAST_TEMPLATES: Record<string, Record<RoastTone, string[]>> = {
 @Injectable()
 export class RoastEngineService {
   generateRoast(input: GenerateRoastInput) {
-    const rupees = (input.amountPaise / 100).toFixed(2);
-    const yearly = ((input.amountPaise / 100) * 365).toFixed(0);
+    const amountPaise = assertFiniteNumber(input.amountPaise, 'amountPaise');
+    const monthlySpendPaise = assertFiniteNumber(input.monthlySpendPaise, 'monthlySpendPaise');
+    const monthlyBudgetPaise =
+      input.monthlyBudgetPaise === undefined
+        ? undefined
+        : assertFiniteNumber(input.monthlyBudgetPaise, 'monthlyBudgetPaise');
+
+    const rupees = (amountPaise / 100).toFixed(2);
+    const yearly = ((amountPaise / 100) * 365).toFixed(0);
     const tone = input.tone || RoastTone.BRUTAL;
 
     const categoryKey = ROAST_TEMPLATES[input.categoryName] ? input.categoryName : 'DEFAULT';
@@ -83,8 +102,8 @@ export class RoastEngineService {
 
     // Calculate damage score (0 - 100)
     let damageScore = 20;
-    if (input.monthlyBudgetPaise && input.monthlyBudgetPaise > 0) {
-      const percentUsed = (input.monthlySpendPaise / input.monthlyBudgetPaise) * 100;
+    if (monthlyBudgetPaise && monthlyBudgetPaise > 0) {
+      const percentUsed = (monthlySpendPaise / monthlyBudgetPaise) * 100;
       damageScore = Math.min(100, Math.round(percentUsed));
     }
 

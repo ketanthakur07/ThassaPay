@@ -1,25 +1,79 @@
-import { assertValidTransition, InvalidPaymentTransitionError } from '../src/payments/payment-state-machine';
+import {
+  assertValidTransition,
+  InvalidPaymentTransitionError,
+  CLIENT_TRIGGERABLE,
+} from '../src/payments/payment-state-machine';
+import { PaymentStatus } from '@prisma/client';
 
-describe('payment state machine', () => {
-  it('allows INITIATED -> AWAITING_CONFIRMATION', () => {
-    expect(() => assertValidTransition('INITIATED', 'AWAITING_CONFIRMATION')).not.toThrow();
-  });
+/**
+ * Audit (Phase 4, Step 10): exhaustive transition matrix. Every (from, to)
+ * pair is asserted against the state machine so an accidental edit to
+ * ALLOWED_TRANSITIONS cannot silently reintroduce INITIATED -> SUCCESS.
+ */
+const ALL: PaymentStatus[] = [
+  'INITIATED',
+  'AWAITING_CONFIRMATION',
+  'NEEDS_REVIEW',
+  'SUCCESS',
+  'FAILED',
+  'CANCELLED',
+];
 
-  it('allows AWAITING_CONFIRMATION -> NEEDS_REVIEW (sweep timeout)', () => {
-    expect(() => assertValidTransition('AWAITING_CONFIRMATION', 'NEEDS_REVIEW')).not.toThrow();
-  });
+/**
+ * Audit (Step 10) matrix — mirrors the spec:
+ *   INITIATED -> AWAITING_CONFIRMATION / CANCELLED / FAILED   ALLOWED
+ *   AWAITING_CONFIRMATION -> SUCCESS / FAILED / NEEDS_REVIEW / CANCELLED  ALLOWED
+ *   NEEDS_REVIEW -> SUCCESS / FAILED                            ALLOWED
+ *   INITIATED -> SUCCESS, FAILED -> SUCCESS, CANCELLED -> SUCCESS  MUST FAIL
+ * CANCELLED from AWAITING_CONFIRMATION exists so a retried/differing return
+ * report cannot strand the attempt; CANCELLED is terminal, so it can never
+ * manufacture SUCCESS.
+ */
+const LEGAL: Record<PaymentStatus, PaymentStatus[]> = {
+  INITIATED: ['AWAITING_CONFIRMATION', 'CANCELLED', 'FAILED'],
+  AWAITING_CONFIRMATION: ['SUCCESS', 'FAILED', 'NEEDS_REVIEW', 'CANCELLED'],
+  NEEDS_REVIEW: ['SUCCESS', 'FAILED'],
+  SUCCESS: [],
+  FAILED: [],
+  CANCELLED: [],
+};
 
-  it('allows NEEDS_REVIEW -> SUCCESS (user confirms)', () => {
-    expect(() => assertValidTransition('NEEDS_REVIEW', 'SUCCESS')).not.toThrow();
-  });
+describe('payment state machine — full transition matrix', () => {
+  it.each(ALL.flatMap((from) => ALL.map((to) => ({ from, to }))))(
+    '$from -> $to',
+    ({ from, to }) => {
+      const legal = LEGAL[from].includes(to);
+      if (legal) {
+        expect(() => assertValidTransition(from, to)).not.toThrow();
+      } else {
+        expect(() => assertValidTransition(from, to)).toThrow(InvalidPaymentTransitionError);
+      }
+    },
+  );
 
-  it('rejects INITIATED -> SUCCESS directly — this is the whole point', () => {
+  it('never allows INITIATED -> SUCCESS directly — the core financial invariant', () => {
     expect(() => assertValidTransition('INITIATED', 'SUCCESS')).toThrow(InvalidPaymentTransitionError);
   });
 
-  it('rejects any transition out of a terminal state', () => {
-    expect(() => assertValidTransition('SUCCESS', 'FAILED')).toThrow(InvalidPaymentTransitionError);
-    expect(() => assertValidTransition('FAILED', 'SUCCESS')).toThrow(InvalidPaymentTransitionError);
-    expect(() => assertValidTransition('CANCELLED', 'INITIATED')).toThrow(InvalidPaymentTransitionError);
+  it('never allows terminal states to transition anywhere', () => {
+    for (const terminal of ['SUCCESS', 'FAILED', 'CANCELLED'] as PaymentStatus[]) {
+      for (const to of ALL) {
+        expect(() => assertValidTransition(terminal, to)).toThrow(InvalidPaymentTransitionError);
+      }
+    }
+  });
+
+  it('restricts what unauthenticated client input can trigger', () => {
+    // A client may move an attempt to AWAITING_CONFIRMATION (claim of return)
+    // or CANCELLED, but SUCCESS/FAILED/NEEDS_REVIEW need verification flow.
+    expect(CLIENT_TRIGGERABLE).toEqual(['AWAITING_CONFIRMATION', 'CANCELLED']);
+    expect(CLIENT_TRIGGERABLE).not.toContain('SUCCESS');
+    expect(CLIENT_TRIGGERABLE).not.toContain('NEEDS_REVIEW');
+  });
+
+  it('keeps every terminal state terminal — no edge out of SUCCESS/FAILED/CANCELLED', () => {
+    for (const terminal of ['SUCCESS', 'FAILED', 'CANCELLED'] as PaymentStatus[]) {
+      expect(LEGAL[terminal]).toEqual([]);
+    }
   });
 });

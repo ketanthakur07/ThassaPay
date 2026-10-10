@@ -1,10 +1,11 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../common/prisma.service';
 import { ExpenseSource, PaymentMethod } from '@prisma/client';
 
 export interface CreateExpenseDto {
   categoryId: string;
-  amountPaise: number | bigint;
+  /** Integer paise as number, bigint, or exact string (from validated JSON). */
+  amountPaise: number | bigint | string;
   paymentMethod: PaymentMethod;
   description?: string;
   expenseDate?: string;
@@ -16,8 +17,16 @@ export class ExpensesService {
   constructor(private readonly prisma: PrismaService) {}
 
   async create(userId: string, dto: CreateExpenseDto) {
-    const expenseDate = dto.expenseDate ? new Date(dto.expenseDate) : new Date();
+    // Audit fix (P0): negative and zero amounts were accepted and stored,
+    // silently corrupting budgets/analytics. Reject before anything is written.
     const amountPaise = BigInt(dto.amountPaise);
+    if (amountPaise <= 0n) {
+      throw new BadRequestException('Amount must be greater than zero');
+    }
+    const expenseDate = dto.expenseDate ? new Date(dto.expenseDate) : new Date();
+    if (isNaN(expenseDate.getTime())) {
+      throw new BadRequestException('Invalid expenseDate');
+    }
 
     return this.prisma.expense.create({
       data: {
@@ -40,7 +49,12 @@ export class ExpensesService {
     userId: string,
     query: { month?: string; categoryId?: string; limit?: number; offset?: number },
   ) {
-    const where: any = { userId, deletedAt: null };
+    const where: {
+      userId: string;
+      deletedAt: null;
+      categoryId?: string;
+      expenseDate?: { gte: Date; lte: Date };
+    } = { userId, deletedAt: null };
 
     if (query.categoryId) {
       where.categoryId = query.categoryId;
@@ -105,6 +119,12 @@ export class ExpensesService {
       throw new NotFoundException('Original expense not found');
     }
 
+    // Same financial-identity guard as create(): a correction is still a write.
+    const newAmountPaise = BigInt(newDto.amountPaise);
+    if (newAmountPaise <= 0n) {
+      throw new BadRequestException('Amount must be greater than zero');
+    }
+
     // Soft delete original
     await this.prisma.expense.update({
       where: { id: expenseId },
@@ -116,7 +136,7 @@ export class ExpensesService {
       data: {
         userId,
         categoryId: newDto.categoryId,
-        amountPaise: BigInt(newDto.amountPaise),
+        amountPaise: newAmountPaise,
         paymentMethod: newDto.paymentMethod,
         source: original.source,
         description: newDto.description || original.description,

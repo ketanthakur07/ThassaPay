@@ -1,5 +1,6 @@
 import { Body, Controller, Get, Post, Query, UseGuards } from '@nestjs/common';
 import { BudgetsService } from './budgets.service';
+import { SetBudgetRequestDto } from '../expenses/expenses.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { CurrentUser, CurrentUserPayload } from '../common/decorators/current-user.decorator';
 
@@ -8,10 +9,15 @@ import { CurrentUser, CurrentUserPayload } from '../common/decorators/current-us
 export class BudgetsController {
   constructor(private readonly budgetsService: BudgetsService) {}
 
+  /**
+   * Audit fix (P1): month/amount were unvalidated — arbitrary strings went
+   * into the DB unique key and negative budgets were accepted. Now validated,
+   * and money arrives as an exact integer-paise string.
+   */
   @Post()
   async setBudget(
     @CurrentUser() user: CurrentUserPayload,
-    @Body() body: { month: string; amountPaise: number },
+    @Body() body: SetBudgetRequestDto,
   ) {
     return this.budgetsService.setMonthlyBudget(user.id, body.month, body.amountPaise);
   }
