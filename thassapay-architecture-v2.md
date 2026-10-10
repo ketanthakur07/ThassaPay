@@ -1,162 +1,1169 @@
-# ThassaPay — Architecture v2 (Real-Money Revision)
+# ThassaPay — Architecture v3
 
-The original doc had the right instincts (payment ≠ expense, UPI isolated behind an
-adapter). What it was missing is everything that only bites you once real money and
-real users show up. This version fixes those gaps and is what the code scaffold is
-built from.
+### Real-Money Architecture + Roast Engine
 
-## 1. The core problem the original design ignored
+The original architecture correctly separated **payment from expense**, isolated UPI behind an adapter, and treated uncertain UPI outcomes carefully.
 
-**UPI Intent has no reliable "it actually succeeded" signal for a third-party app.**
-You launch Google Pay/PhonePe via intent, the user does whatever they do, and the app
-returns control to you with... whatever that app feels like returning. It can be
-absent, delayed, or simply wrong (user backgrounds the app mid-flow, OS kills your
-activity, etc.). The original doc's status enum (`SUCCESS/FAILED/CANCELLED/UNKNOWN`)
-was honest about this but didn't design *around* it. A real system needs:
+This revision keeps those foundations and adds a core ThassaPay product feature:
 
-- A payment state machine with explicit transitions and a background reconciler
-- A hard rule: **the backend never trusts client-reported success alone**
-- A path for the user to manually confirm/dispute an `UNKNOWN` payment
-- Eventually, a real PSP/aggregator (Razorpay, Cashfree, PhonePe PG, etc.) if you want
-  authoritative webhook-based confirmation instead of "app came back to foreground"
+> **ThassaPay tracks your money. ThassaPay also judges your financial decisions.**
 
-This isn't a nice-to-have — it's the single biggest correctness risk in the whole app.
-Get this wrong and users see expenses that didn't happen, or don't see ones that did.
+The roast system is intentionally separated from payment correctness. A roast can react to a payment, but it can never decide whether a payment succeeded, create financial records, modify balances, or interfere with the payment flow.
 
-## 2. Payment state machine (replaces the flat enum)
+---
 
+# 1. Core Problem
+
+UPI Intent does not provide ThassaPay with a universally authoritative confirmation that money actually moved.
+
+The application can launch Google Pay, PhonePe, Paytm, or another UPI application and regain control later. The result returned to ThassaPay may be missing, delayed, incomplete, or unreliable.
+
+Therefore ThassaPay must be designed around three principles:
+
+1. **The backend never trusts client-reported success alone.**
+2. **Payment state is modeled as a state machine with explicit transitions.**
+3. **Financial records are separate from the UI roast/personality layer.**
+
+A user may see:
+
+> **"BSDK FIRSE SOCH LE 💀"**
+
+before a large payment, but that message has no authority over whether the payment succeeds.
+
+---
+
+# 2. High-Level Architecture
+
+```text
+                         ┌───────────────────────────┐
+                         │          ThassaPay         │
+                         │    React Native + Expo     │
+                         └─────────────┬─────────────┘
+                                       │
+                                  HTTPS / API
+                                       │
+                                       ▼
+                  ┌────────────────────────────────────┐
+                  │             NestJS API               │
+                  ├────────────────────────────────────┤
+                  │ Authentication                      │
+                  │ Users                               │
+                  │ Expenses                            │
+                  │ Budgets                             │
+                  │ Payments                            │
+                  │ Analytics                           │
+                  │ Notifications                       │
+                  │ Roast Engine                        │
+                  │ Admin / RBAC                         │
+                  └───────────────┬────────────────────┘
+                                  │
+                   ┌──────────────┴──────────────┐
+                   ▼                             ▼
+          ┌─────────────────┐           ┌─────────────────┐
+          │   PostgreSQL    │           │      Redis      │
+          │                 │           │                 │
+          │ Users           │           │ BullMQ          │
+          │ Expenses        │           │ Rate limits     │
+          │ Payments        │           │ Cache           │
+          │ Events          │           │ Scheduled jobs  │
+          │ Budgets         │           └─────────────────┘
+          │ Roast events    │
+          └─────────────────┘
+                   │
+                   │
+       ┌───────────┴─────────────────────┐
+       ▼                                 ▼
+┌───────────────────────┐       ┌────────────────────────┐
+│    Payment System     │       │     Roast Engine       │
+│                       │       │                        │
+│ UPI Intent Adapter    │       │ Trigger Detection      │
+│ Payment State Machine │       │ Context Analysis       │
+│ Reconciliation        │       │ Roast Selection        │
+│ Payment Events        │       │ Cooldowns              │
+└──────────┬────────────┘       │ User Roast Settings   │
+           │                    └────────────┬───────────┘
+           ▼                                 ▼
+   Google Pay / PhonePe                Roast shown in UI
+   Paytm / Other UPI Apps
 ```
-INITIATED ──(user opens UPI app)──> AWAITING_CONFIRMATION
-                                          │
-                    ┌─────────────────────┼─────────────────────┐
-                    ▼                     ▼                     ▼
-                SUCCESS               FAILED              (timeout, 10 min)
-                    │                     │                     ▼
-                    ▼                     ▼                 NEEDS_REVIEW
-             expense created      expense NOT created            │
-                                                          user confirms/denies
-                                                                  │
-                                                        ┌─────────┴─────────┐
-                                                        ▼                   ▼
-                                                    SUCCESS              FAILED
+
+---
+
+# 3. Payment State Machine
+
+```text
+INITIATED
+    │
+    │ User opens UPI app
+    ▼
+AWAITING_CONFIRMATION
+    │
+    ├───────────────┬─────────────────┐
+    ▼               ▼                 ▼
+ SUCCESS          FAILED        TIMEOUT / UNKNOWN
+    │               │                 │
+    ▼               ▼                 ▼
+Expense         No Expense       NEEDS_REVIEW
+Created                              │
+                                     │
+                              User confirms
+                                     │
+                              ┌──────┴──────┐
+                              ▼             ▼
+                           SUCCESS        FAILED
+                              │             │
+                              ▼             ▼
+                           Expense       No Expense
+                           created
 ```
 
-Rules:
-- Only `SUCCESS` creates/finalizes an `Expense`. Nothing else does, ever.
-- A scheduled job sweeps `AWAITING_CONFIRMATION` rows older than N minutes into
-  `NEEDS_REVIEW` and pushes a notification: *"Did the ₹250 payment to canteen@upi go
-  through?"* with Yes/No, which the user answers once.
-- Every state transition is written to an **append-only `payment_events` table** (not
-  just overwriting a `status` column) so you can reconstruct what happened, which
-  matters the moment a user disputes something.
+### Rules
 
-## 3. Idempotency (missing entirely from v1)
+Only `SUCCESS` creates/finalizes an expense.
 
-Mobile networks drop requests. Users double-tap "Pay". Without an idempotency key,
-`POST /payments/create` retried by the client (intentionally or by a flaky network)
-creates two payment attempts for one intended payment.
+`FAILED`, `CANCELLED`, `AWAITING_CONFIRMATION`, and `NEEDS_REVIEW` must not create a finalized expense.
 
-- Client generates a UUID per payment attempt and sends it as `Idempotency-Key`.
-- Backend stores it as a unique column on `payment_attempts`. A retry with the same
-  key returns the existing row instead of creating a new one.
-- Same pattern applies to expense creation from any client-driven action.
+The reconciliation process periodically checks unresolved payment attempts.
 
-## 4. Money as integers, not floats/decimals-in-app-code
+When an attempt becomes `NEEDS_REVIEW`, the user receives something like:
 
-`amount` as a JS number anywhere near money is a bug waiting to happen (₹0.1 + ₹0.2
-problems, rounding drift in analytics aggregation). Fix:
-- Store money as **`BigInt` paise** in Postgres (`amount_paise bigint`), never rupees-as-float.
-- A single `Money` value object in `common/money` is the only place that formats
-  paise → ₹ for display, and the only place that parses user input → paise. Nothing
-  else touches currency math directly.
+> **Did the ₹250 payment to canteen@upi actually go through?**
 
-## 5. Schema fixes
+Actions:
 
-Problems in v1's schema and the fix:
+```text
+[ YES, I PAID ]
+[ NO, IT FAILED ]
+```
 
-| v1 issue | Fix |
-|---|---|
-| `category_id` duplicated on both `expenses` and `payment_attempts` — can drift | Category lives only on `expenses`. A `payment_attempt` doesn't need a category; the expense it produces does. |
-| No idempotency key column | Added, unique, indexed. |
-| `status` as a bare string with no history | Kept as current-state column *plus* an append-only `payment_events` table. |
-| No audit trail for money-relevant admin actions | `audit_logs` table, immutable (no UPDATE/DELETE grants at the DB role level). |
-| No tenant/college scoping at the schema level | `college_id` on `users` from day one — retrofitting tenant scoping later means a painful backfill + migration on a live money table. |
-| Floats implied for `amount` | `BigInt` paise everywhere. |
-| No soft-delete / correction path for expenses | `expenses.deleted_at`, `expenses.corrected_from_id` — money records should never hard-delete; corrections are new rows referencing the original. |
+Every payment-state transition is recorded in an append-only `payment_events` table.
 
-## 6. Security additions v1 didn't cover
+---
 
-- **Refresh token rotation**, not just a long-lived JWT — a stolen token shouldn't be
-  a forever-key into someone's financial history.
-- **Per-user rate limiting** on payment creation specifically (not just a global rate
-  limiter) — a compromised account shouldn't be able to hammer the payment endpoint.
-- **Field-level encryption** for anything beyond what's needed operationally — UPI IDs
-  and payee details are still sensitive; encrypt at rest, not just "the disk is
-  encrypted."
-- **DPDP Act 2023 (India)** compliance basics: explicit consent capture for data use,
-  a data export endpoint, a data deletion endpoint (account closure ≠ silent orphaned
-  rows — needs a real retention/deletion policy for financial records vs. account PII).
-- **Secrets** out of `.env` committed anywhere — a real secrets manager (Doppler,
-  AWS/GCP secrets manager, even Railway's/Render's built-in secret store) from day one,
-  because retrofitting this after a leak is how breaches happen.
-- Admin module gets **RBAC**, not "is logged in" — v1 listed an admin module with no
-  access-control model at all.
+# 4. Idempotency
 
-## 7. Regulatory framing (v1 mentioned NPCI but didn't draw the actual line)
+Every payment attempt receives a unique UUID.
 
-- As long as ThassaPay **never holds, custodies, or moves funds itself** — it only
-  *initiates* a UPI Intent that hands off to the user's own UPI app and bank — it stays
-  out of PPI (Prepaid Payment Instrument) and TPAP licensing territory. This is a load-bearing
-  constraint on the product, not a footnote: **don't add wallet balance, hold funds,
-  or peer-to-peer transfer features** without re-evaluating this, because that's the
-  line into "you're now a regulated payment entity."
-- If you later move to a PSP/aggregator, you're doing "merchant-side" integration
-  (a bank/aggregator acquires the payment on your behalf), not becoming a TPAP
-  yourself — different and much lighter compliance lift.
+```text
+Client
+   │
+   │ Idempotency-Key: UUID
+   ▼
+Backend
+   │
+   ├── Key does not exist
+   │       ↓
+   │   Create payment attempt
+   │
+   └── Key already exists
+           ↓
+      Return existing attempt
+```
 
-## 8. Operational maturity v1 skipped entirely
+This prevents duplicate payment attempts caused by:
 
-- **Structured logging + error tracking** (Sentry or similar) from the first deploy,
-  not added later. Payment bugs reported by students three weeks after the fact are
-  unfindable without logs.
-- **Migrations pipeline**: Prisma migrate in CI, never hand-run against prod.
-- **Staging environment** with its own database before "real app, real users" — a
-  payment bug tested only in prod is a bug a student's ₹500 finds for you.
-- **Metrics/alerting**: alert on payment failure-rate spikes and on `NEEDS_REVIEW`
-  queue depth growing — that queue is your canary for "the UPI intent flow started
-  behaving differently."
+* double taps
+* network retries
+* app retries
+* request timeouts
+* unstable mobile connections
 
-## 9. Revised MVP scope
+The same principle should be applied to other client-triggered money-changing operations.
 
-Same spirit as v1's staged rollout, adjusted for the above:
+---
 
-**V1 (college project → real users)**
-- Google OAuth (college-domain restricted)
-- Manual expenses, categories, monthly budget
-- UPI Intent payment flow **with the state machine + reconciliation sweep above**
-- Idempotent payment creation
-- Basic analytics (spend by category, budget remaining)
-- Audit log for payment state transitions
+# 5. Money Representation
 
-**V2**
-- PSP/aggregator integration for authoritative status (removes most of the
-  `NEEDS_REVIEW` cases)
-- Receipt upload, recurring expenses, CSV/PDF export
-- Push notifications via FCM
+Money is stored as **integer paise**.
 
-**V3**
-- Merchant/mess integrations, admin dashboard with proper RBAC, campus marketplace
+```text
+₹250.75
 
-## 10. Stack (unchanged where v1 was right, tightened where it wasn't)
+        ↓
 
-| Layer | Choice | Note |
-|---|---|---|
-| Mobile | React Native + Expo | unchanged |
-| Backend | NestJS + TypeScript | unchanged |
-| ORM | Prisma | unchanged, but money columns as `BigInt` |
-| DB | PostgreSQL | + a `payment_events` audit table, immutable at DB-role level |
-| Cache/queue | Redis | also backs the reconciliation sweep job (BullMQ) |
-| Auth | Google OAuth + JWT w/ refresh rotation | rotation added |
-| Secrets | Doppler / cloud secrets manager | new — not in v1 |
-| Errors/logs | Sentry + structured JSON logs | new — not in v1 |
-| Deployment | Railway/Render + managed Postgres, **separate staging** | staging added |
+25075 paise
+```
+
+Database:
+
+```text
+amount_paise BIGINT
+```
+
+The application must not perform financial calculations using floating-point values.
+
+A single `Money` abstraction handles:
+
+```text
+parse ₹ input → paise
+paise → formatted ₹ output
+addition
+subtraction
+comparison
+percentage calculations
+```
+
+No other part of the codebase should implement its own money conversion.
+
+---
+
+# 6. Database Architecture
+
+## USERS
+
+```text
+id
+college_id
+name
+email
+phone
+hostel_block
+room_no
+created_at
+updated_at
+deleted_at
+```
+
+## CATEGORIES
+
+```text
+id
+name
+icon
+is_default
+created_at
+```
+
+Examples:
+
+```text
+FOOD
+LAUNDRY
+GYM
+TRAVEL
+SHOPPING
+COLLEGE
+SUBSCRIPTIONS
+ENTERTAINMENT
+OTHER
+```
+
+## BUDGETS
+
+```text
+id
+user_id
+month
+amount_paise
+created_at
+updated_at
+```
+
+## EXPENSES
+
+```text
+id
+user_id
+category_id
+amount_paise
+payment_method
+description
+expense_date
+status
+payment_attempt_id
+corrected_from_id
+deleted_at
+created_at
+updated_at
+```
+
+## PAYMENT_ATTEMPTS
+
+```text
+id
+user_id
+amount_paise
+upi_id
+idempotency_key
+reference_id
+status
+initiated_at
+completed_at
+failure_reason
+created_at
+updated_at
+```
+
+`idempotency_key` must be unique.
+
+## PAYMENT_EVENTS
+
+```text
+id
+payment_attempt_id
+from_status
+to_status
+event_type
+metadata
+created_at
+```
+
+This table is append-only.
+
+## AUDIT_LOGS
+
+```text
+id
+actor_id
+actor_type
+action
+entity_type
+entity_id
+metadata
+created_at
+```
+
+Money-relevant administrative actions must be auditable.
+
+---
+
+# 7. Roast Engine
+
+## Purpose
+
+The **Roast Engine** is the personality layer of ThassaPay.
+
+It observes financial events and selects an appropriate reaction.
+
+It should **never modify financial state**.
+
+```text
+Financial Event
+      │
+      ▼
+Roast Engine
+      │
+      ├── Analyze amount
+      ├── Analyze category
+      ├── Analyze time
+      ├── Analyze frequency
+      ├── Analyze budget
+      ├── Analyze history
+      └── Analyze context
+              │
+              ▼
+        Trigger Matcher
+              │
+              ▼
+        Roast Selection
+              │
+              ▼
+       UI / Notification
+```
+
+---
+
+# 8. Roast Triggers
+
+ThassaPay should support contextual triggers rather than random jokes.
+
+## Balance triggers
+
+```text
+BALANCE_LOW
+BALANCE_CRITICAL
+BALANCE_ZERO
+BUDGET_50
+BUDGET_75
+BUDGET_90
+BUDGET_100
+BUDGET_EXCEEDED
+```
+
+Examples:
+
+> **"Chud gaye guru 💀"**
+
+> **"Bhai bas ₹87 bache hain. Ab hawa kha."**
+
+> **"Budget khatam. Month nahi."**
+
+> **"Paise aaye the. Tumne jaane diya."**
+
+---
+
+## Large-payment triggers
+
+A large payment should be calculated relative to the user's spending pattern rather than using only a fixed amount.
+
+Example:
+
+```text
+Average transaction = ₹180
+Current transaction = ₹2,400
+```
+
+The system detects an unusually large payment.
+
+Potential roast:
+
+> **"BSDK FIRSE SOCH LE."**
+
+> **"₹2,400??? Bhai confirm kar le, shaadi toh nahi kar raha?"**
+
+> **"Itna paisa kis confidence mein uda raha hai?"**
+
+> **"Bro saw his balance and chose violence."**
+
+---
+
+## Repeated spending
+
+```text
+FOOD_3_TIMES_TODAY
+FOOD_5_TIMES_TODAY
+SHOPPING_REPEAT
+MULTIPLE_PAYMENTS_SHORT_WINDOW
+```
+
+Example:
+
+```text
+12:10 PM → ₹180 Food
+2:40 PM  → ₹240 Food
+7:20 PM  → ₹320 Food
+11:45 PM → ₹280 Food
+```
+
+Roast:
+
+> **"Bhai tu kha raha hai ya Swiggy ko sponsor kar raha hai?"**
+
+---
+
+# 9. Category-Specific Roasts
+
+## Food
+
+> **"Mess mein kya problem hai bhai?"**
+
+> **"Pet full. Bank empty. Classic."**
+
+> **"Again? Bhai digestive system ko bhi semester break de."**
+
+> **"Mess fee bhi di hai btw 💀"**
+
+## Gym
+
+> **"₹800 paid. Attendance loading..."**
+
+> **"Membership active. You? Debatable."**
+
+> **"Bro bought DLC for a body he hasn't used."**
+
+## Laundry
+
+> **"Kapde dhul gaye, paise bhi."**
+
+> **"At least something got washed this week."**
+
+## Shopping
+
+> **"Need tha? Ya dopamine ka monthly recharge?"**
+
+> **"Drip acquired. Budget deceased."**
+
+## Travel
+
+> **"Destination reached. Financial stability did not."**
+
+## Subscription
+
+> **"Another company successfully finessed you."**
+
+---
+
+# 10. Time-Based Roasts
+
+The Roast Engine should also understand time.
+
+## Late night
+
+```text
+TIME > 23:00
+CATEGORY = FOOD
+```
+
+Potential responses:
+
+> **"11:47 PM — academic comeback cancelled."**
+
+> **"Bhai so ja. Swiggy ko bhi sona hai."**
+
+## Extremely late
+
+```text
+TIME > 01:00
+```
+
+> **"Raat ke 1 baje ₹340 ki biryani. Priorities immaculate."**
+
+---
+
+# 11. Roast Escalation
+
+The system should classify roast intensity.
+
+```text
+LEVEL 0
+Normal
+    ↓
+LEVEL 1
+Suspicious
+    ↓
+LEVEL 2
+Roast
+    ↓
+LEVEL 3
+Savage
+    ↓
+LEVEL 4
+Critical
+```
+
+Example:
+
+```text
+₹200
+"Reasonable."
+
+₹1,000
+"Hmm. Interesting decision."
+
+₹3,000
+"Bhai seriously?"
+
+₹5,000
+"BSDK FIRSE SOCH LE."
+
+₹0 balance
+"CHUD GAYE GURU 💀"
+```
+
+---
+
+# 12. Roast Personalization
+
+The Roast Engine should use the user's own historical behavior.
+
+Example:
+
+Last month:
+
+```text
+Food = ₹1,800
+```
+
+This month:
+
+```text
+Food = ₹3,100
+```
+
+Roast:
+
+> **"Food spending up 72%. Bro has discovered hunger."**
+
+Another example:
+
+```text
+Gym subscription = ₹1,000
+Gym visits = 3
+```
+
+Roast:
+
+> **"₹333 per workout. Premium membership fr."**
+
+The system should favor **contextual jokes over random jokes**.
+
+---
+
+# 13. Roast Cooldowns
+
+The app should not become annoying.
+
+Each trigger gets a cooldown.
+
+Example:
+
+```text
+BALANCE_ZERO
+→ maximum once per balance event
+
+FOOD_REPEAT
+→ maximum once every 3 hours
+
+BIG_PAYMENT
+→ once per qualifying transaction
+
+BUDGET_90
+→ once per threshold crossing
+```
+
+This prevents:
+
+```text
+₹0
+"CHUD GAYE GURU"
+
+reload app
+"CHUD GAYE GURU"
+
+open expense page
+"CHUD GAYE GURU"
+
+notification
+"CHUD GAYE GURU"
+```
+
+Nobody wants that.
+
+---
+
+# 14. Roast Preferences
+
+Settings:
+
+```text
+Roast Mode
+
+[ ON ]
+
+Intensity
+○ Light
+○ Normal
+● Savage
+
+Language
+☑ English
+☑ Hinglish
+
+Profanity
+☑ Allow
+
+Notifications
+☑ Roast notifications
+☐ Roasts on every transaction
+```
+
+Default mode should be **Normal**, with stronger language available as an opt-in setting.
+
+---
+
+# 15. Roast Database
+
+Roasts should be stored separately from application logic.
+
+## ROAST_TEMPLATES
+
+```text
+id
+trigger_type
+category
+severity
+text
+language
+is_active
+cooldown_seconds
+created_at
+updated_at
+```
+
+Example:
+
+```text
+id: 41
+trigger: BALANCE_ZERO
+severity: CRITICAL
+text: "Chud gaye guru 💀"
+language: HINGLISH
+```
+
+Another:
+
+```text
+id: 82
+trigger: LARGE_PAYMENT
+category: FOOD
+severity: SAVAGE
+text: "BSDK firse soch le."
+language: HINGLISH
+```
+
+This allows new jokes to be added without changing backend business logic.
+
+---
+
+# 16. Roast Events
+
+Every displayed roast can optionally be recorded.
+
+## ROAST_EVENTS
+
+```text
+id
+user_id
+trigger_type
+expense_id
+roast_template_id
+context_snapshot
+displayed_at
+```
+
+This allows ThassaPay to understand:
+
+* which roasts are being shown
+* which triggers happen most often
+* which jokes repeat
+* whether cooldowns are functioning
+* which roast categories are most active
+
+Roast analytics must remain separate from financial ledger truth.
+
+---
+
+# 17. Important Architecture Rule
+
+The Roast Engine is **downstream of financial events**.
+
+Correct:
+
+```text
+Payment
+   ↓
+Payment State Machine
+   ↓
+Expense Ledger
+   ↓
+Analytics
+   ↓
+Roast Engine
+```
+
+Incorrect:
+
+```text
+Payment
+   ↓
+Roast Engine
+   ↓
+"Funny response"
+   ↓
+Payment status
+```
+
+The roast engine must never be able to:
+
+* approve a payment
+* reject a payment
+* mark payment success
+* modify an expense
+* modify balance
+* modify transaction status
+
+---
+
+# 18. Expense Tracking UI
+
+Instead of a traditional finance-app interface:
+
+### Financial Damage
+
+```text
+SEPTEMBER
+
+₹7,240
+TOTAL DAMAGE
+
+₹2,760
+STILL ALIVE
+```
+
+Categories:
+
+```text
+🍔 Food          ₹2,840
+🛍️ Shopping      ₹1,420
+🏋️ Gym             ₹800
+🚕 Travel           ₹620
+🧺 Laundry          ₹410
+```
+
+Example transaction:
+
+```text
+₹349
+Food
+Swiggy
+11:48 PM
+
+"Could've eaten at mess btw."
+```
+
+---
+
+# 19. Monthly Post-Mortem
+
+Rename the monthly report:
+
+## THE POST-MORTEM
+
+```text
+September
+
+Allowance       ₹10,000
+Total Damage     ₹9,740
+Remaining          ₹260
+
+TOP CRIME
+Food — ₹3,120
+
+MOST SUSPICIOUS
+₹2,499 at 1:26 AM
+
+MOST REPEATED
+Food × 27
+
+WALLET STATUS
+"₹260 left. Welcome to hard mode."
+```
+
+---
+
+# 20. Special Easter Eggs
+
+Rare event-driven easter eggs:
+
+```text
+₹0.00
+→ "CHUD GAYE GURU."
+
+₹69
+→ "Nice."
+
+₹420
+→ "No comment."
+
+₹666
+→ "Bro summoned something."
+
+1 rupee transaction
+→ "Financial discipline final boss."
+
+69th transaction
+→ "Nice."
+
+420th transaction
+→ "We need to talk."
+
+5 payments in 10 minutes
+→ "Bro is conducting economic activity."
+
+Payment at 3:33 AM
+→ "Brother what are we doing."
+```
+
+These should be low-frequency and never interfere with real finance information.
+
+---
+
+# 21. Authentication
+
+```text
+Google OAuth
+      ↓
+College-domain verification
+      ↓
+Access Token
+      ↓
+Refresh Token
+      ↓
+ThassaPay API
+```
+
+Refresh tokens should rotate.
+
+Users should only be able to access their own financial records.
+
+---
+
+# 22. Security
+
+```text
+Mobile App
+    │
+    │ HTTPS
+    ▼
+API
+    │
+    ├── Authentication
+    ├── Authorization
+    ├── Validation
+    ├── Rate Limiting
+    └── Payment-specific rate limiting
+            │
+            ▼
+       Application
+            │
+            ▼
+       PostgreSQL
+```
+
+Requirements:
+
+* no UPI PIN storage
+* no bank-password storage
+* no secrets committed to Git
+* encrypted sensitive fields where appropriate
+* RBAC for admin
+* immutable payment/audit history
+* structured logs
+* error tracking
+* rate limiting
+* staging environment
+* database migrations through CI/CD
+
+---
+
+# 23. Operational Architecture
+
+```text
+                     GitHub
+                        │
+                        ▼
+                     CI/CD
+                  ┌─────┴─────┐
+                  ▼           ▼
+              Staging      Production
+                  │           │
+                  ▼           ▼
+             Test DB       Prod DB
+```
+
+Supporting infrastructure:
+
+```text
+Sentry
+  ↓
+Error Tracking
+
+JSON Logs
+  ↓
+Application Monitoring
+
+Redis + BullMQ
+  ↓
+Reconciliation Jobs
+Roast Cooldowns
+Scheduled Tasks
+Notifications
+```
+
+Metrics should include:
+
+```text
+payment_success_rate
+payment_failure_rate
+needs_review_count
+payment_latency
+api_error_rate
+roast_trigger_count
+```
+
+The `NEEDS_REVIEW` queue is particularly important because a sudden increase can indicate a problem in the payment flow.
+
+---
+
+# 24. API Structure
+
+```text
+/auth
+    POST /login
+    POST /refresh
+    POST /logout
+
+/users
+    GET /me
+    PATCH /me
+
+/expenses
+    GET /
+    POST /
+    GET /:id
+    PATCH /:id
+    POST /:id/correct
+
+/budgets
+    GET /current
+    POST /
+    PATCH /:id
+
+/categories
+    GET /
+
+/payments
+    POST /create
+    GET /:id
+    POST /:id/review
+
+/analytics
+    GET /summary
+    GET /categories
+    GET /trend
+
+/roasts
+    GET /current
+    GET /history
+    PATCH /settings
+
+/admin
+    GET /users
+    GET /audit-logs
+    GET /payments
+```
+
+---
+
+# 25. Project Structure
+
+```text
+thassapay/
+│
+├── apps/
+│   │
+│   ├── mobile/
+│   │   ├── app/
+│   │   │   ├── login/
+│   │   │   ├── dashboard/
+│   │   │   ├── expenses/
+│   │   │   ├── pay/
+│   │   │   ├── budgets/
+│   │   │   ├── analytics/
+│   │   │   ├── roast/
+│   │   │   └── settings/
+│   │   │
+│   │   ├── components/
+│   │   ├── services/
+│   │   ├── store/
+│   │   └── utils/
+│   │
+│   └── api/
+│       ├── src/
+│       │   ├── auth/
+│       │   ├── users/
+│       │   ├── expenses/
+│       │   ├── budgets/
+│       │   ├── categories/
+│       │   ├── payments/
+│       │   ├── analytics/
+│       │   ├── notifications/
+│       │   ├── roast/
+│       │   ├── admin/
+│       │   └── common/
+│       │
+│       ├── prisma/
+│       └── package.json
+│
+├── packages/
+│   ├── money/
+│   ├── types/
+│   └── validation/
+│
+└── README.md
+```
+
+---
+
+# 26. MVP Scope
+
+## V1 — College Project + Real Users
+
+```text
+✅ Google OAuth
+✅ College-domain restriction
+✅ Manual expenses
+✅ Categories
+✅ Monthly budget
+✅ UPI Intent
+✅ Payment state machine
+✅ Idempotent payment creation
+✅ NEEDS_REVIEW flow
+✅ Payment events
+✅ Basic analytics
+✅ Audit logging
+✅ Roast Engine
+✅ Roast settings
+✅ Contextual roasts
+```
+
+## V2
+
+```text
+✅ PSP / aggregator integration
+✅ Authoritative payment status
+✅ Receipt uploads
+✅ Recurring expenses
+✅ CSV/PDF export
+✅ Push notifications
+✅ More advanced roast personalization
+✅ QR payment flow
+```
+
+## V3
+
+```text
+✅ Merchant integrations
+✅ Mess integration
+✅ Laundry integration
+✅ Campus marketplace
+✅ Admin dashboard
+✅ Full RBAC
+✅ Advanced analytics
+✅ Social/shared expense features
+```
+
+---
+
+# 27. Final Product Identity
+
+ThassaPay is not:
+
+> "Another expense tracker."
+
+It is:
+
+> **A hostel-first money app that lets students pay through UPI, track every rupee, understand where their money went, and get absolutely roasted for their financial decisions.**
+
+The core loop is:
+
+```text
+           PAY
+            ↓
+       RECORD MONEY
+            ↓
+        ANALYZE IT
+            ↓
+       REALIZE THE DAMAGE
+            ↓
+          GET ROASTED
+            ↓
+      TRY TO DO BETTER
+            ↓
+          PAY AGAIN 💀
+```
+
+### ThassaPay's personality:
+
+**Finance app on the surface.
+Hostel friend underneath.**
