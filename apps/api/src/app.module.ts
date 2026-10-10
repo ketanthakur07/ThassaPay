@@ -1,6 +1,8 @@
 import { Module } from '@nestjs/common';
+import { APP_GUARD } from '@nestjs/core';
 import { ScheduleModule } from '@nestjs/schedule';
-import { ThrottlerModule } from '@nestjs/throttler';
+import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
+import './common/bigint-json'; // ensures BigInt money serialization in every entry point
 import { PaymentsModule } from './payments/payments.module';
 import { AuthModule } from './auth/auth.module';
 import { UsersModule } from './users/users.module';
@@ -22,6 +24,12 @@ import { RoastEngineModule } from './roast-engine/roast-engine.module';
     CategoriesModule,
     AnalyticsModule,
     RoastEngineModule,
+  ],
+  providers: [
+    // Audit fix (P1): ThrottlerModule was configured but never enforced —
+    // without APP_GUARD the global 100 req/60s limit was dead configuration and
+    // every endpoint (OTP request especially) was effectively unthrottled.
+    { provide: APP_GUARD, useClass: ThrottlerGuard },
   ],
 })
 export class AppModule {}
