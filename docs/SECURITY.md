@@ -23,10 +23,88 @@ ThassaPay is a financial-tracking and UPI payment-initiation application. Studen
 
 ### Refresh Tokens
 
-- **Lifetime**: 7 days
-- **Storage**: Hashed with bcrypt before storage in `users.refresh_token_hash`
-- **Rotation**: Every `/auth/refresh` call invalidates the old token hash and issues a new one
-- **Revocation**: `/auth/logout` clears `refresh_token_hash` — the old token is immediately invalid even before expiry
+Implemented as **opaque rotating tokens with hash-only storage** (see
+`apps/api/src/auth/refresh-token.service.ts`).
+
+- **Format**: opaque — 32 cryptographically random bytes, base64url-encoded
+  (~43 chars). Deliberately **not a JWT**: an opaque string has no readable
+  claims and can only be redeemed at `/auth/refresh`, which is exactly the
+  property we want from a refresh credential.
+- **Lifetime**: 30 days from issue. Rotation **slides** the window — each
+  successful refresh mints a successor with a fresh 30-day expiry. There is
+  currently **no absolute cap** on session length (see Limitations).
+- **Server storage**: only `sha256(token)` is persisted, under a unique index
+  (`refresh_sessions.token_hash`). The raw token is returned to the client
+  exactly once and never written to the DB, so a database leak yields no
+  redeemable tokens. We use a fast hash (SHA-256) rather than bcrypt/argon2 on
+  purpose: those exist to slow down guesses of **low-entropy** secrets
+  (passwords). A 256-bit random token has no guessable surface, so a fast
+  collision-resistant hash is the correct tool.
+- **Device storage**: both tokens are persisted **only** through
+  `expo-secure-store` (Keychain on iOS, Keystore/EncryptedSharedPreferences on
+  Android), via the adapter in `services/secureStorage.ts`. They are written as
+  **one serialized pair under a single key**, so a pair is never half-updated.
+  There is **no localStorage/AsyncStorage fallback on native** — if SecureStore
+  is unavailable every read/write/delete throws (`SecureStorageError`) rather
+  than silently downgrading. A failed secure write during login/refresh is
+  surfaced as a failure; it never reports a session that was not actually
+  persisted. Values are never logged. Legacy plaintext token keys from before
+  this change are purged on startup (without being read or migrated), forcing a
+  clean re-authentication.
+- **Rotation**: every `POST /auth/refresh` **consumes** the presented token and
+  issues its successor in the same family. Consumption is a conditional `UPDATE`
+  (`consumed_at IS NULL AND revoked_at IS NULL`), so under Postgres row locking
+  **exactly one** of any number of concurrent refreshes can win — two parallel
+  requests can never mint two valid branches.
+- **Reuse detection**: presenting a token that is already consumed or revoked
+  means it leaked (an honest client only ever holds the newest token), so the
+  **entire family is revoked** and the caller gets the same generic `401`.
+- **Revocation / logout**:
+  - `POST /auth/logout` — revokes the session **family** behind the presented
+    refresh token. Ownership is enforced: the token's session must belong to the
+    authenticated user; a mismatch is a silent no-op (no existence oracle).
+    Logout is idempotent and always returns success.
+  - `POST /auth/logout-all` — revokes **every** live session for the user.
+  - **Session policy**: one device login == one family. `logout` = this device;
+    `logout-all` = all devices.
+- **Concurrency**: a lost rotation race returns `401` **without** minting a
+  branch and **without** revoking the family (a benign double-refresh from one
+  client is indistinguishable from a raced replay, and killing the family would
+  log out a legitimate user).
+- **Generic errors**: every failure mode — unknown, expired, revoked, consumed,
+  raced — returns the identical `Invalid or expired session`, so the endpoint is
+  an oracle for nothing.
+- **Access-token interaction**: refresh/logout do **not** revoke access JWTs.
+  A signed access token stays valid until its 15-minute expiry. That lifetime is
+  the hard bound on how long a stolen/revoked session can keep acting, which is
+  why access tokens must stay short.
+
+### Limitations (refresh tokens)
+
+- **No absolute session cap** — a token used regularly keeps sliding its 30-day
+  window forever. Add a fixed family deadline if long-lived sessions are a
+  concern.
+- **First-fraud window** — if a live token is stolen and the attacker redeems
+  it before the legitimate client, the attacker gets a valid successor and the
+  reuse detection fires only when the victim's copy is next used. Rotation
+  narrows this window; it cannot eliminate it without a device binding.
+- **No device binding / session list UI** — the schema supports per-session
+  revocation but there is no user-facing "active sessions" screen yet.
+- **Mobile web is unsupported for authenticated sessions** — SecureStore is not
+  a secure persistence mechanism on web, and ThassaPay does not currently ship
+  a web target (no `react-native-web` / `react-dom`). The adapter **throws** on
+  web rather than downgrading to localStorage. Shipping web later requires a
+  separate secure flow (HttpOnly / Secure / SameSite cookie) and its own backend
+  work — it must not reuse the localStorage path.
+- **Failed secure delete can leave a token on disk** — if a SecureStore delete
+  fails at logout, the in-memory session is terminated for the rest of the run
+  (reads return null), but the persisted entry may survive until a later
+  successful clear or app uninstall. This bounds, but does not eliminate, the
+  exposure.
+- **No physical-device verification yet** — SecureStore behaviour is covered by
+  a mocked test double in CI. Keychain/Keystore has **not** been exercised on a
+  real Android or iOS build (no Android SDK / iOS toolchain in this
+  environment); a device pass is required before launch.
 
 ### Google OAuth
 
