@@ -42,6 +42,9 @@
     "web": {
       "favicon": "./assets/favicon.png"
     },
-    "scheme": "thassapay"
+    "scheme": "thassapay",
+    "plugins": [
+      "expo-secure-store"
+    ]
   }
 }

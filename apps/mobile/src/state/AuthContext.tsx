@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
 import { storage } from '../services/storage';
-import { apiClient } from '../services/api/apiClient';
+import { apiClient, onSessionExpired, isSessionRejection } from '../services/api/apiClient';
 import { RoastTone } from '@thassapay/types';
 
 interface AuthUser {
@@ -47,6 +47,14 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
   useEffect(() => {
     bootstrapSession();
+    // When a refresh is definitively rejected the apiClient clears tokens and
+    // fires this — drop the user back to login wherever they are in the app.
+    const unsubscribe = onSessionExpired(() => {
+      setUser(null);
+      setIsAuthenticated(false);
+      setIsOnboarded(false);
+    });
+    return unsubscribe;
   }, []);
 
   const bootstrapSession = async () => {
@@ -62,13 +70,36 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       setIsAuthenticated(true);
       // If user has set hostelBlock or name is customized, considered onboarded
       setIsOnboarded(!!me.hostelBlock);
-    } catch {
-      // Token invalid or expired
-      await storage.removeAccessToken();
-      await storage.removeUserSession();
-      setUser(null);
-      setIsAuthenticated(false);
-      setIsOnboarded(false);
+    } catch (error) {
+      if (isSessionRejection(error)) {
+        // DEFINITIVE: the server rejected this session (rotated/revoked/
+        // expired) — apiClient already cleared it; drop local state too.
+        await storage.clearTokens();
+        await storage.removeUserSession();
+        setUser(null);
+        setIsAuthenticated(false);
+        setIsOnboarded(false);
+      } else {
+        // TRANSIENT: offline start, timeout, 5xx or a secure-storage read
+        // failure. The persisted session may be perfectly valid — a failed
+        // startup must NOT log the user out. Keep the tokens and fall back to
+        // the cached profile when we have one; the next successful call (or
+        // the 401 refresh path) decides for real.
+        const cached = await storage.getUserSession().catch(() => null);
+        const restored: AuthUser | null =
+          cached &&
+          typeof cached.id === 'string' &&
+          cached.id &&
+          typeof cached.name === 'string' &&
+          typeof cached.email === 'string'
+            ? { ...cached, id: cached.id, name: cached.name, email: cached.email }
+            : null;
+        if (restored) {
+          setUser(restored);
+          setIsAuthenticated(true);
+          setIsOnboarded(!!restored.hostelBlock);
+        }
+      }
     } finally {
       setIsLoading(false);
     }
@@ -80,7 +111,14 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
   const verifyOtp = async (phone: string, otp: string) => {
     const res = await apiClient.auth.verifyOtp(phone, otp);
-    await storage.setAccessToken(res.accessToken);
+    // Persist the pair as ONE atomic secure write. If SecureStore fails we must
+    // NOT report a successful login — a half-persisted session (or a refresh
+    // token that only lives in memory) would silently break on next launch.
+    // Re-throw so the login screen can show a safe, actionable message.
+    await storage.saveTokenPair({
+      accessToken: res.accessToken,
+      refreshToken: res.refreshToken,
+    });
     await storage.setUserSession(res.user);
     setUser(res.user);
     setIsAuthenticated(true);
@@ -122,7 +160,19 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   };
 
   const logout = async () => {
-    await storage.removeAccessToken();
+    // Revoke server-side FIRST so the refresh token cannot be replayed. Read
+    // it before clearing local state; if the network is down we still clear
+    // locally (the token expires within 15 min anyway) rather than trap the
+    // user in a half-logged-in state.
+    const refreshToken = await storage.getRefreshToken();
+    if (refreshToken) {
+      try {
+        await apiClient.auth.logout(refreshToken);
+      } catch {
+        // Best-effort: proceed to local cleanup regardless.
+      }
+    }
+    await storage.clearTokens();
     await storage.removeUserSession();
     setUser(null);
     setIsAuthenticated(false);

@@ -12,6 +12,7 @@ import {
 } from 'react-native';
 import { colors } from '../../theme/colors';
 import { apiClient } from '../../services/api/apiClient';
+import { paymentIntentKey, completePaymentIntent } from '../../services/paymentIdempotency';
 import { vpaSchema } from '@thassapay/validation';
 import { Money } from '@thassapay/money';
 
@@ -81,8 +82,17 @@ export const PayScreen: React.FC<PayScreenProps> = ({ onPaymentInitiated, onCanc
     setIsLoading(true);
     try {
       const amountPaise = Number(money.toPaise());
-      // Generate client idempotency key
-      const idempotencyKey = `pay_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+      // Idempotency key is STABLE for retries of this same payment: if the
+      // first attempt timed out (server may have created it anyway), pressing
+      // "Pay" again reuses the key so POST /v1/payments returns the existing
+      // attempt instead of creating a duplicate one. Changing the payment
+      // details — or completing it — mints a fresh key.
+      const idempotencyKey = paymentIntentKey({
+        upiId: upiId.trim(),
+        amount: rupeesInput.trim(),
+        categoryId: selectedCategoryId,
+        description: note.trim() || undefined,
+      });
 
       // 3. Create backend PaymentAttempt (state machine: INITIATED).
       // Audit fix (P0): the backend expects amount as a rupee STRING (it parses
@@ -120,6 +130,8 @@ export const PayScreen: React.FC<PayScreenProps> = ({ onPaymentInitiated, onCanc
 
         // Notify return to payment state machine verification screen
         onPaymentInitiated(paymentAttempt.id, selectedCategoryId, amountPaise);
+        // The backend accepted THIS attempt — the next payment is a new intent.
+        completePaymentIntent();
       });
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Failed to initiate UPI payment');
@@ -135,7 +147,13 @@ export const PayScreen: React.FC<PayScreenProps> = ({ onPaymentInitiated, onCanc
           <Text style={styles.headerTag}>UPI PAYMENT INITIATION</Text>
           <Text style={styles.title}>Scan & Pay UPI</Text>
         </View>
-        <TouchableOpacity onPress={onCancel}>
+        <TouchableOpacity
+          onPress={() => {
+            // Abandoning the flow starts fresh next time — never carry a
+            // half-used idempotency key into an unrelated payment.
+            completePaymentIntent();
+            onCancel();
+          }}>
           <Text style={styles.cancelText}>Cancel</Text>
         </TouchableOpacity>
       </View>
