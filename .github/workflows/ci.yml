@@ -1,0 +1,119 @@
+name: CI
+
+# Triggers: every PR, and pushes to the default branches. No deploy jobs, no
+# registry publishing — CI only verifies.
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: the workflow only needs to read the repo.
+permissions:
+  contents: read
+
+# One run per ref; superseded runs are cancelled (saves minutes on PR pushes).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Typecheck, lint, build, unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24' # same major as the locally-verified runtime; engines allow >=20
+          cache: npm
+
+      - name: Install dependencies (lockfile-exact)
+        run: npm ci
+
+      # The Prisma client must be generated before typecheck/build/tests —
+      # monorepo hoisting means @prisma/client's postinstall cannot be relied
+      # on to find apps/api/prisma/schema.prisma.
+      - name: Generate Prisma client
+        run: npm run prisma:generate --workspace=thassapay-backend
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      # All unit suites are hermetic: Prisma is mocked, so no database is
+      # needed (and none is started) in this job.
+      - name: Unit tests
+        run: npm run test
+
+  integration:
+    name: Live API integration (disposable Postgres + Redis)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npm run prisma:generate --workspace=thassapay-backend
+
+      - name: Build API
+        run: npm run build --workspace=thassapay-backend
+
+      # Disposable, throwaway infrastructure on the runner itself — test-only
+      # credentials from docker-compose.yml (thassapay/thassapay_local, local
+      # port 5432/6390). CI never connects to any real database or cache.
+      - name: Start local Postgres + Redis (docker compose)
+        run: docker compose up -d
+
+      - name: Wait for Postgres to accept connections
+        run: |
+          for i in $(seq 1 60); do
+            if docker exec thassapay_db pg_isready -U thassapay -d postgres >/dev/null 2>&1; then
+              echo "Postgres is ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Postgres never became ready" >&2
+          exit 1
+
+      # The integration harness (apps/api/audit-integration.sh) targets its own
+      # dedicated database so it can never touch dev data. Create + migrate it
+      # against the disposable container only.
+      - name: Create and migrate the disposable integration database
+        run: |
+          docker exec thassapay_db createdb -U thassapay thassapay_audit_test
+          DATABASE_URL="postgresql://thassapay:thassapay_local@localhost:5432/thassapay_audit_test" \
+            npx prisma migrate deploy --schema apps/api/prisma/schema.prisma
+
+      # Boots the built API on port 3111, exercises the real HTTP surface
+      # (auth/refresh rotation + reuse detection + logout revocation, payment
+      # state machine, idempotency, money integrity, cross-user isolation,
+      # rate limiting, restart persistence), then kills it.
+      - name: Run live integration suite
+        run: cd apps/api && bash audit-integration.sh
+
+      # Server boot log only (Nest route mappings + job logs; no tokens, OTPs
+      # or credentials are written there by the app).
+      - name: Upload API log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-integration-log
+          path: apps/api/api-integration.log
+          if-no-files-found: ignore
