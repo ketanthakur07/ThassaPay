@@ -141,3 +141,35 @@ Go alone"* — no production-readiness claim is made.
 **To finish Phase 6**, attach an Android device (Expo Go 51.0.x), follow §2, and
 execute Tests A–E, replacing each BLOCKED row with PASS/FAIL plus sanitized
 logs. iOS remains a separate, also-untested platform.
+
+---
+
+## 6. Re-inspection — 2026-10-19 (still BLOCKED)
+
+The environment was re-checked during the git-checkpoint / CI session. Nothing
+below is device evidence; the physical-device requirement stays **BLOCKED**.
+
+| Item | Re-check finding |
+| --- | --- |
+| Android SDK | still absent (`ANDROID_HOME` unset, no SDK directory) |
+| Emulator | none — no SDK emulator installed; installing large SDK components was out of scope for this session |
+| adb | **no longer on PATH** — the GlideX-bundled adb seen on 2026-10-18 could not be located this time; with no adb there is no device channel at all |
+| Connected devices | none (no adb; previously confirmed empty twice) |
+| Java | 22.0.2 present |
+| Expo tooling | legacy global `expo-cli` 0.18.31 (deprecated, refuses Node ≥ 17) + `eas-cli` 24.0.0; project-local Expo SDK 51 unchanged |
+| Host LAN IPv4 | changed since §2 (DHCP): now `192.168.137.1` / `172.18.160.21` — substitute the current value in the §2 commands |
+| Mobile env | still no `apps/mobile/.env`; only `.env.example` (no secrets committed) |
+
+**Static verification of the committed token path (C1) — code-level, not device
+behavior:** in the committed source, the access/refresh pair is written only via
+`saveSecure` → `expo-secure-store` as one serialized pair under a single key;
+every read/write/delete throws `SecureStorageError` when SecureStore is
+unavailable (no localStorage/AsyncStorage fallback exists); the in-memory map in
+`storage.ts` caches only non-secret UI state (profile, flags), never tokens.
+This is source inspection plus mocked unit tests — it does **not** establish
+Android Keystore behavior.
+
+Quality gates at this checkpoint: typecheck/lint/build exit 0, **270** unit
+tests pass (197 API + 63 mobile + 5 + 5), live backend integration 88/88 —
+all backend/mocked evidence, no device evidence. Requirement status: Tests A–E
+remain BLOCKED pending an attached Android device.
