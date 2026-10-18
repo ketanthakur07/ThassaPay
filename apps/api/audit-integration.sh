@@ -298,6 +298,16 @@ echo "== restart persistence: sessions live in Postgres, not in-process =="
 req POST "$API/auth/otp/request" '{"phoneNumber":"9812345672"}'; OR1=$(val devOtp)
 req POST "$API/auth/otp/verify" '{"phoneNumber":"9812345672","otp":"'"$OR1"'"}'
 AUTH_R=$(val accessToken); RT_R=$(val refreshToken)
+# A payment created BEFORE the restart must survive it with state intact —
+# this is the "app killed mid-flow" case: the server must hold recoverable
+# state, not an in-memory guess. (Uses user R so the per-user payment rate
+# limit of the MAIN user stays untouched.)
+SAVE_AUTH="$AUTH"; AUTH="$AUTH_R"
+IDEMP_PR="pay_prerestart_${RUN}_0001"
+req POST "$API/payments" '{"upiId":"canteen@okaxis","amount":"55.00","idempotencyKey":"'"$IDEMP_PR"'","categoryId":"'"$CATEGORY"'","description":"Pre-restart payment"}'
+check "pre-restart payment created -> 201" "201" "$CODE"
+PID_PRE=$(val id)
+AUTH="$SAVE_AUTH"
 # Kill and relaunch the API process — in-memory state would be lost here.
 kill "$API_PID" 2>/dev/null
 wait "$API_PID" 2>/dev/null
@@ -330,6 +340,66 @@ check "consumed OTP not replayable after restart -> 401" "401" "$CODE"
 # 6. Post-restart state persisted: revoked rows are queryable from the DB.
 REV_AFTER=$(docker exec -i thassapay_db psql -U thassapay -d thassapay_audit_test -At -c "SELECT count(*) FROM refresh_sessions WHERE \"revokedAt\" IS NOT NULL;")
 if [ "$REV_AFTER" -gt 0 ]; then ok "revocations still in DB after restart (${REV_AFTER} rows)"; else bad "revocations still in DB after restart" "0 rows"; fi
+# 7. The pre-restart payment survived the restart: same attempt, same state,
+#    same idempotency key — a recoverable server-side record, not a client guess.
+CODE=$(curl -sS -o "$BODY" -w '%{http_code}' "$API/payments/$PID_PRE" -H "Authorization: Bearer $AUTH_R")
+check "pre-restart payment lookup after restart -> 200" "200" "$CODE"
+check "pre-restart payment still INITIATED after restart" "INITIATED" "$(val status)"
+check "pre-restart idempotency key unchanged after restart" "$IDEMP_PR" "$(val idempotencyKey)"
+
+echo "== auth renewal cannot duplicate a payment =="
+# Simulate an expired access token for a real payment create: re-sign the
+# user's own claims (decoded from their valid token) with the harness's local
+# test secret and a past exp. The guard must reject it BEFORE any state is
+# written, and the retry after "refresh" must reuse the same idempotency key.
+SAVE_AUTH="$AUTH"; AUTH="$AUTH_R"
+EXPIRED_JWT=$(node -e "const jwt=require('jsonwebtoken');const claims=jwt.decode(process.argv[1]);delete claims.iat;delete claims.exp;process.stdout.write(jwt.sign(claims,process.env.JWT_ACCESS_SECRET,{expiresIn:-60}))" "$AUTH_R")
+IDEMP_AR="pay_authretry_${RUN}_0001"
+CODE=$(curl -sS -o "$BODY" -w '%{http_code}' -X POST "$API/payments" -H "Authorization: Bearer $EXPIRED_JWT" -H 'Content-Type: application/json' \
+  -d '{"upiId":"canteen@okaxis","amount":"66.00","idempotencyKey":"'"$IDEMP_AR"'","categoryId":"'"$CATEGORY"'"}')
+check "expired access token on payment create -> 401" "401" "$CODE"
+BLOCKED_ROWS=$(docker exec -i thassapay_db psql -U thassapay -d thassapay_audit_test -At -c "SELECT count(*) FROM payment_attempts WHERE \"idempotencyKey\"='$IDEMP_AR';")
+check "401 created no payment row" "0" "$BLOCKED_ROWS"
+# The client "refreshes" (new access token) and retries the SAME logical
+# operation — same key. It must succeed as exactly one attempt.
+req POST "$API/payments" '{"upiId":"canteen@okaxis","amount":"66.00","idempotencyKey":"'"$IDEMP_AR"'","categoryId":"'"$CATEGORY"'"}'
+check "retry after auth renewal -> 201" "201" "$CODE"
+PID_AR=$(val id)
+req POST "$API/payments" '{"upiId":"canteen@okaxis","amount":"66.00","idempotencyKey":"'"$IDEMP_AR"'","categoryId":"'"$CATEGORY"'"}'
+check "second retry returns the SAME attempt (no duplicate)" "$PID_AR" "$(val id)"
+AR_ROWS=$(docker exec -i thassapay_db psql -U thassapay -d thassapay_audit_test -At -c "SELECT count(*) FROM payment_attempts WHERE \"idempotencyKey\"='$IDEMP_AR';")
+check "exactly one row for the auth-retry key" "1" "$AR_ROWS"
+AUTH="$SAVE_AUTH"
+
+echo "== reconciliation sweep (compiled job, real DB) =="
+# Drive a payment to AWAITING_CONFIRMATION, backdate its timeout clock instead
+# of waiting 10 real minutes, then run the COMPILED ReconciliationJob.sweep()
+# from dist against the disposable DB. The API's own 5-minute cron may race
+# this — the conditional updateMany makes that safe, and the event-count
+# assertions below hold either way.
+SAVE_AUTH="$AUTH"; AUTH="$AUTH_R"
+IDEMP_RC="pay_recon_${RUN}_0001"
+req POST "$API/payments" '{"upiId":"canteen@okaxis","amount":"33.00","idempotencyKey":"'"$IDEMP_RC"'","categoryId":"'"$CATEGORY"'"}'
+check "recon payment created -> 201" "201" "$CODE"
+PID_RC=$(val id)
+req POST "$API/payments/$PID_RC/return" '{"outcome":"app_returned_ok"}'
+check "recon payment return -> AWAITING_CONFIRMATION" "AWAITING_CONFIRMATION" "$(val status)"
+AUTH="$SAVE_AUTH"
+docker exec -i thassapay_db psql -U thassapay -d thassapay_audit_test -At -c "UPDATE payment_attempts SET \"awaitingSince\" = now() - interval '15 minutes' WHERE id='$PID_RC';" > /dev/null
+node -e "const{ReconciliationJob}=require('./dist/payments/reconciliation.job.js');const{PrismaClient}=require('@prisma/client');(async()=>{const j=new ReconciliationJob(new PrismaClient());await j.sweep();process.exit(0);})().catch(e=>{console.error(e);process.exit(1);})" > /dev/null 2>&1
+check "sweep exit 0 (compiled job ran against real DB)" "0" "$?"
+RC_STATUS=$(docker exec -i thassapay_db psql -U thassapay -d thassapay_audit_test -At -c "SELECT status::text FROM payment_attempts WHERE id='$PID_RC';")
+check "stale attempt moved to NEEDS_REVIEW" "NEEDS_REVIEW" "$RC_STATUS"
+RC_EVENTS=$(docker exec -i thassapay_db psql -U thassapay -d thassapay_audit_test -At -c "SELECT count(*) FROM payment_events WHERE \"paymentAttemptId\"='$PID_RC' AND \"toStatus\"='NEEDS_REVIEW' AND reason='sweep_timeout';")
+check "exactly one sweep_timeout audit event" "1" "$RC_EVENTS"
+# A second sweep must be a no-op (idempotent) and must never create expenses.
+node -e "const{ReconciliationJob}=require('./dist/payments/reconciliation.job.js');const{PrismaClient}=require('@prisma/client');(async()=>{const j=new ReconciliationJob(new PrismaClient());await j.sweep();process.exit(0);})().catch(e=>{console.error(e);process.exit(1);})" > /dev/null 2>&1
+RC_EVENTS2=$(docker exec -i thassapay_db psql -U thassapay -d thassapay_audit_test -At -c "SELECT count(*) FROM payment_events WHERE \"paymentAttemptId\"='$PID_RC' AND \"toStatus\"='NEEDS_REVIEW' AND reason='sweep_timeout';")
+check "second sweep adds no duplicate event (idempotent)" "1" "$RC_EVENTS2"
+RC_EXP=$(docker exec -i thassapay_db psql -U thassapay -d thassapay_audit_test -At -c "SELECT count(*) FROM expenses WHERE \"paymentAttemptId\"='$PID_RC';")
+check "sweep never creates an expense" "0" "$RC_EXP"
+RC_STILL=$(docker exec -i thassapay_db psql -U thassapay -d thassapay_audit_test -At -c "SELECT status::text FROM payment_attempts WHERE id='$PID_RC';")
+check "sweep never silently marks SUCCESS" "NEEDS_REVIEW" "$RC_STILL"
 
 echo
 echo "================ INTEGRATION RESULT: PASS=$PASS FAIL=$FAIL ================"
