@@ -29,7 +29,14 @@ beforeEach(() => {
 });
 
 function makeAuth(): AuthService {
-  return new AuthService(prismaMock as any, new JwtService({ secret: 'test-secret' }));
+  return new AuthService(
+    prismaMock as any,
+    new JwtService({ secret: 'test-secret' }),
+    // Mock refresh service: OTP verify now opens a session family. Only the
+    // shape matters here — the refresh lifecycle itself is under test in
+    // refresh-token.spec.ts.
+    { issueForUser: jest.fn().mockResolvedValue({ token: 'raw-refresh-token', sessionId: 's1', familyId: 'f1', expiresAt: new Date() }) } as any,
+  );
 }
 
 describe('OTP request throttle (1 per minute)', () => {
@@ -156,6 +163,8 @@ describe('OTP verification', () => {
     const { devOtp } = await auth.requestPhoneOtp(PHONE);
     const res = await auth.verifyPhoneOtp(PHONE, devOtp!);
     expect(JSON.stringify(res)).not.toContain(devOtp!);
-    expect(Object.keys(res)).toEqual(['accessToken', 'user']);
+    // Login returns the access/refresh pair plus the profile — and never the OTP.
+    expect(Object.keys(res)).toEqual(['accessToken', 'refreshToken', 'user']);
+    expect(res.refreshToken).toBe('raw-refresh-token');
   });
 });

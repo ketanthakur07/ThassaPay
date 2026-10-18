@@ -1,4 +1,4 @@
-import { Matches, MaxLength } from 'class-validator';
+import { IsString, Matches, MaxLength } from 'class-validator';
 
 /**
  * Audit addition (P1): both auth endpoints took a bare inline object type, so
@@ -26,4 +26,21 @@ export class VerifyOtpDto {
 
   @Matches(/^\d{6}$/, { message: 'OTP must be 6 digits' })
   otp!: string;
+}
+
+/**
+ * Refresh/logout bodies carry the opaque refresh token. It is bounded in
+ * length and required so an empty body can never reach the credential store.
+ */
+export class RefreshTokenDto {
+  @IsString()
+  @MaxLength(512)
+  refreshToken!: string;
+}
+
+/** Logout may optionally name the session to revoke; omit for "this one". */
+export class LogoutDto {
+  @IsString()
+  @MaxLength(512)
+  refreshToken!: string;
 }

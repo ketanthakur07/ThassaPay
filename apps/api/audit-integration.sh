@@ -90,11 +90,72 @@ req POST "$API/auth/otp/verify" '{"phoneNumber":"9765432109","otp":"'"$O1"'"}'
 check "otp/verify valid -> 201" "201" "$CODE"
 AUTH=$(val accessToken)
 if [ -n "$AUTH" ] && [ "$AUTH" != "undefined" ]; then ok "access token issued"; else bad "access token issued" "$AUTH"; fi
+RT=$(val refreshToken)
+if [ -n "$RT" ] && [ "$RT" != "undefined" ]; then ok "refresh token issued at login"; else bad "refresh token issued at login" "$RT"; fi
 
 req GET "$API/users/me"
 check "GET /users/me -> 200" "200" "$CODE"
 if grep -qiE 'refreshTokenHash|googleSub' "$BODY"; then bad "/users/me hides auth material" "leaked refreshTokenHash/googleSub"; else ok "/users/me hides refreshTokenHash+googleSub"; fi
 if grep -q '"hostelBlock"' "$BODY"; then ok "/users/me still returns profile fields"; else bad "/users/me profile fields" "$(cat "$BODY")"; fi
+
+echo "== refresh-token rotation + logout revocation =="
+# Refresh replaces the refresh token; the old one must stop working.
+req POST "$API/auth/refresh" '{"refreshToken":"'"$RT"'"}'
+check "refresh -> 201" "201" "$CODE"
+AUTH2=$(val accessToken); RT2=$(val refreshToken)
+if [ -n "$RT2" ] && [ "$RT2" != "undefined" ] && [ "$RT2" != "$RT" ]; then ok "refresh rotates the refresh token"; else bad "refresh rotates the refresh token" "same-or-missing token returned"; fi
+if [ -n "$AUTH2" ] && [ "$AUTH2" != "undefined" ]; then ok "refresh returns a new access token"; else bad "refresh returns a new access token" "$AUTH2"; fi
+# The rotated (consumed) token is rejected on replay.
+req POST "$API/auth/refresh" '{"refreshToken":"'"$RT"'"}'
+check "replayed old refresh token -> 401" "401" "$CODE"
+# The new access token authenticates.
+CODE=$(curl -sS -o "$BODY" -w '%{http_code}' "$API/users/me" -H "Authorization: Bearer $AUTH2")
+check "new access token authorises /users/me -> 200" "200" "$CODE"
+# Replaying the consumed token burned the family: the newest token dies too.
+req POST "$API/auth/refresh" '{"refreshToken":"'"$RT2"'"}'
+check "family revoked after reuse: newest token -> 401" "401" "$CODE"
+# Unknown token -> the same generic 401 (no existence oracle).
+req POST "$API/auth/refresh" '{"refreshToken":"totally-made-up-token"}'
+check "unknown refresh token -> 401" "401" "$CODE"
+# Logout revokes the session server-side. A fresh phone/user avoids waiting out
+# the 1-request-per-minute OTP throttle (the control stays fully enforced).
+# NOTE: `req` always sends the global $AUTH as the bearer token, so we point
+# $AUTH at the OWNING user before each logout — the ownership check must see a
+# match or it (correctly) no-ops. Cross-user protection is asserted separately.
+MAIN_AUTH="$AUTH"   # preserve the main user for the later money suites
+req POST "$API/auth/otp/request" '{"phoneNumber":"9812345670"}'; OL1=$(val devOtp)
+req POST "$API/auth/otp/verify" '{"phoneNumber":"9812345670","otp":"'"$OL1"'"}'
+USER_L_AUTH=$(val accessToken); RT_L=$(val refreshToken)
+# Cross-user: authenticate as the MAIN user (a different account) while
+# presenting user L's refresh token. The ownership check must refuse to revoke.
+AUTH="$MAIN_AUTH"
+req POST "$API/auth/logout" '{"refreshToken":"'"$RT_L"'"}'
+check "cross-user logout -> 201 (idempotent, no leak)" "201" "$CODE"
+req POST "$API/auth/refresh" '{"refreshToken":"'"$RT_L"'"}'
+check "cross-user logout did NOT revoke -> 201" "201" "$CODE"
+# Now the OWNER logs out — this must revoke.
+AUTH="$USER_L_AUTH"
+req POST "$API/auth/logout" '{"refreshToken":"'"$RT_L"'"}'
+check "owner logout -> 201" "201" "$CODE"
+req POST "$API/auth/refresh" '{"refreshToken":"'"$RT_L"'"}'
+check "logged-out refresh token -> 401" "401" "$CODE"
+# logout-all revokes every session for the user. (Multi-session revocation is
+# covered directly in the unit suite; here we assert the HTTP path kills a
+# live session.)
+req POST "$API/auth/otp/request" '{"phoneNumber":"9812345671"}'; OA1=$(val devOtp)
+req POST "$API/auth/otp/verify" '{"phoneNumber":"9812345671","otp":"'"$OA1"'"}'
+AUTH=$(val accessToken); RT_A1=$(val refreshToken)
+req POST "$API/auth/logout-all" '{}'
+check "logout-all -> 201" "201" "$CODE"
+req POST "$API/auth/refresh" '{"refreshToken":"'"$RT_A1"'"}'
+check "post logout-all refresh token -> 401" "401" "$CODE"
+AUTH="$MAIN_AUTH"   # restore the main user for the money suites below
+# Persistence: the revocation is a DB row, not in-memory — it survives a restart.
+REVOKED=$(docker exec -i thassapay_db psql -U thassapay -d thassapay_audit_test -At -c "SELECT count(*) FROM refresh_sessions WHERE \"revokedAt\" IS NOT NULL;")
+if [ "$REVOKED" -gt 0 ]; then ok "revocations persisted to DB (${REVOKED} rows)"; else bad "revocations persisted to DB" "0 rows"; fi
+# Only hashes are stored — a raw token must never appear in the table.
+RAWLEAK=$(docker exec -i thassapay_db psql -U thassapay -d thassapay_audit_test -At -c "SELECT count(*) FROM refresh_sessions WHERE \"tokenHash\" IN ('"$RT"','"$RT2"','"$RT_L"','"$RT_A1"');")
+check "raw refresh tokens never stored (hashes only)" "0" "$RAWLEAK"
 
 echo "== Step 7/13: expenses (money on the wire) =="
 req POST "$API/expenses" '{"categoryId":"'"$CATEGORY"'","amountPaise":150000,"paymentMethod":"UPI","description":"Mess lunch","expenseDate":"2026-10-07"}'
@@ -230,6 +291,45 @@ EVENTS=$(docker exec -i thassapay_db psql -U thassapay -d thassapay_audit_test -
 echo "  INFO  payment_events rows for that attempt: $EVENTS"
 BAD=$(docker exec -i thassapay_db psql -U thassapay -d thassapay_audit_test -At -c "SELECT count(*) FROM expenses WHERE \"amountPaise\" <= 0;")
 check "no zero/negative money rows" "0" "$BAD"
+
+echo "== restart persistence: sessions live in Postgres, not in-process =="
+# Create a live session BEFORE the restart. (RT from the main login was burned
+# by reuse detection, RT_L/RT_A1 were revoked — all good negative controls.)
+req POST "$API/auth/otp/request" '{"phoneNumber":"9812345672"}'; OR1=$(val devOtp)
+req POST "$API/auth/otp/verify" '{"phoneNumber":"9812345672","otp":"'"$OR1"'"}'
+AUTH_R=$(val accessToken); RT_R=$(val refreshToken)
+# Kill and relaunch the API process — in-memory state would be lost here.
+kill "$API_PID" 2>/dev/null
+wait "$API_PID" 2>/dev/null
+node dist/main.js >> api-integration.log 2>&1 &
+API_PID=$!   # keep the EXIT trap pointed at the new process
+RESTARTED=0
+for i in $(seq 1 40); do
+  sleep 0.5
+  if curl -sS -o /dev/null "$BASE/health"; then RESTARTED=1; break; fi
+done
+if [ "$RESTARTED" = "1" ]; then ok "API restarted"; else bad "API restarted" "health never came back"; fi
+# 1. A live pre-restart refresh token still works (session survived the restart).
+req POST "$API/auth/refresh" '{"refreshToken":"'"$RT_R"'"}'
+check "live refresh token survives restart -> 201" "201" "$CODE"
+RT_R2=$(val refreshToken); AUTH_R2=$(val accessToken)
+# 2. Revocation from BEFORE the restart is still enforced after it.
+req POST "$API/auth/refresh" '{"refreshToken":"'"$RT_L"'"}'
+check "pre-restart revoked token still dead after restart -> 401" "401" "$CODE"
+# 3. Reuse-burned token from BEFORE the restart is still dead after it.
+req POST "$API/auth/refresh" '{"refreshToken":"'"$RT"'"}'
+check "pre-restart consumed token still dead after restart -> 401" "401" "$CODE"
+# 4. The access JWT is stateless and keeps working across the restart.
+CODE=$(curl -sS -o "$BODY" -w '%{http_code}' "$API/users/me" -H "Authorization: Bearer $AUTH_R2")
+check "fresh access token authorises after restart -> 200" "200" "$CODE"
+CODE=$(curl -sS -o "$BODY" -w '%{http_code}' "$API/users/me" -H "Authorization: Bearer $AUTH")
+check "pre-restart access JWT still valid after restart -> 200" "200" "$CODE"
+# 5. OTP store IS in-process (documented P2): a pre-restart devOtp is gone.
+req POST "$API/auth/otp/verify" '{"phoneNumber":"9812345672","otp":"'"$OR1"'"}'
+check "consumed OTP not replayable after restart -> 401" "401" "$CODE"
+# 6. Post-restart state persisted: revoked rows are queryable from the DB.
+REV_AFTER=$(docker exec -i thassapay_db psql -U thassapay -d thassapay_audit_test -At -c "SELECT count(*) FROM refresh_sessions WHERE \"revokedAt\" IS NOT NULL;")
+if [ "$REV_AFTER" -gt 0 ]; then ok "revocations still in DB after restart (${REV_AFTER} rows)"; else bad "revocations still in DB after restart" "0 rows"; fi
 
 echo
 echo "================ INTEGRATION RESULT: PASS=$PASS FAIL=$FAIL ================"

@@ -2,6 +2,7 @@ import { Injectable, UnauthorizedException, BadRequestException } from '@nestjs/
 import { JwtService } from '@nestjs/jwt';
 import { randomInt } from 'crypto';
 import { PrismaService } from '../common/prisma.service';
+import { RefreshTokenService } from './refresh-token.service';
 
 export interface TokenPayload {
   sub: string;
@@ -17,6 +18,13 @@ export interface AuthenticatedUser {
   phone: string | null;
   hostelBlock: string | null;
   roomNo: string | null;
+}
+
+/** What a successful login returns: an access/refresh pair plus the profile. */
+export interface TokenPairResponse {
+  accessToken: string;
+  refreshToken: string;
+  user: AuthenticatedUser;
 }
 
 @Injectable()
@@ -39,7 +47,30 @@ export class AuthService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly jwtService: JwtService,
+    private readonly refreshTokenService: RefreshTokenService,
   ) {}
+
+  /**
+   * Sign a short-lived (15 min) access token for a known user id.
+   *
+   * The userId MUST come from a server-side lookup (an authenticated session or
+   * a verified OTP), never straight from a request body — otherwise a client
+   * could mint an access token for any account.
+   */
+  async signAccessToken(userId: string): Promise<string> {
+    const user = await this.prisma.user.findFirst({
+      where: { id: userId, deletedAt: null },
+    });
+    if (!user) {
+      throw new UnauthorizedException('Invalid or expired session');
+    }
+    const payload: TokenPayload = {
+      sub: user.id,
+      email: user.email,
+      collegeId: user.collegeId,
+    };
+    return this.jwtService.sign(payload);
+  }
 
   async requestPhoneOtp(phone: string): Promise<{ message: string; devOtp?: string }> {
     this.pruneExpiredOtps();
@@ -66,10 +97,7 @@ export class AuthService {
     };
   }
 
-  async verifyPhoneOtp(
-    phone: string,
-    otp: string,
-  ): Promise<{ accessToken: string; user: AuthenticatedUser }> {
+  async verifyPhoneOtp(phone: string, otp: string): Promise<TokenPairResponse> {
     const record = this.otpStore.get(phone);
     if (!record || record.expiresAt < Date.now()) {
       throw new UnauthorizedException('OTP expired or not requested');
@@ -127,8 +155,13 @@ export class AuthService {
 
     const accessToken = this.jwtService.sign(payload);
 
+    // New session family per successful login — the raw refresh token is
+    // returned once and only its hash is stored (see refresh-token.service.ts).
+    const refresh = await this.refreshTokenService.issueForUser(user.id);
+
     return {
       accessToken,
+      refreshToken: refresh.token,
       user: {
         id: user.id,
         name: user.name,

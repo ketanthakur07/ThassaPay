@@ -52,7 +52,10 @@ model User {
   hostelBlock  String?
   roomNo       String?
   googleSub    String   @unique // Google OAuth subject id, not a password
-  refreshTokenHash String? // hashed, rotated on every use
+  // DEPRECATED: superseded by the RefreshSession table (multi-session support,
+  // rotation + reuse detection). Kept (always null) to avoid a destructive
+  // migration; nothing reads or writes it. Drop in a future migration.
+  refreshTokenHash String?
   createdAt    DateTime @default(now())
   deletedAt    DateTime? // soft delete — never hard-delete a user with financial history
 
@@ -61,9 +64,47 @@ model User {
   paymentAttempts PaymentAttempt[]
   upiPayees       UpiPayee[]
   auditLogs       AuditLog[]
+  refreshSessions RefreshSession[]
 
   @@index([collegeId])
   @@map("users")
+}
+
+// A refresh-token session. Rotation + reuse-detection live here.
+//
+// Design notes:
+//  - The client holds an opaque, high-entropy random token; the DB stores ONLY
+//    its SHA-256 hash (tokenHash, unique). The raw token is never persisted.
+//  - `familyId` groups every token descended from one login. Presenting a token
+//    that was already rotated (consumedAt set) or revoked means it leaked, so
+//    the whole family is revoked — that is the standard reuse-detection move.
+//  - `previousSessionId` records the replacement chain for audit/forensics.
+//  - Rotation is atomic at the SQL level (conditional UPDATE on
+//    consumedAt/revokedAt being NULL), so two concurrent refreshes can never
+//    both mint a valid successor.
+//  - `onDelete: Cascade`: a hard user delete must not orphan session rows.
+//    (Users are normally soft-deleted; this is a safety net.)
+model RefreshSession {
+  id                String    @id @default(uuid())
+  userId            String
+  user              User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  familyId          String // groups all rotations descended from one login
+  tokenHash         String    @unique // SHA-256 of the opaque refresh token; never the raw token
+  previousSessionId String? // the token this one replaced
+  issuedAt          DateTime  @default(now())
+  expiresAt         DateTime
+  consumedAt        DateTime? // set when rotated; a consumed token presented again = reuse
+  revokedAt         DateTime? // set on logout / logout-all / reuse detection
+  revokedReason     String? // "logout" | "logout_all" | "reuse_detected"
+
+  // Self-relation: the rotation chain (audit/forensics only).
+  replacedBy   RefreshSession?  @relation("RotationChain", fields: [previousSessionId], references: [id], onDelete: SetNull)
+  replacements RefreshSession[] @relation("RotationChain")
+
+  @@index([userId, revokedAt]) // "list active sessions for user"
+  @@index([familyId]) // "revoke the whole family on reuse"
+  @@index([expiresAt]) // expiry sweeps
+  @@map("refresh_sessions")
 }
 
 model Category {

@@ -3,14 +3,14 @@ import { JwtService } from '@nestjs/jwt';
 
 /**
  * Verifies the access token and attaches req.user. Access tokens are short-lived
- * (15 min).
+ * (15 min) and are NOT revoked on logout — they stay valid until expiry, which
+ * is why the lifetime must stay short.
  *
- * Audit note (Step 9): the original doc comment referenced a rotated refresh
- * token flow at /auth/refresh — that endpoint, the refresh token and the
- * logout/revocation path DO NOT EXIST in this codebase (users.refreshTokenHash
- * is always null). Today a 15-minute token simply expires and the user logs in
- * again. Never extend access-token lifetime as a fix for UX friction; implement
- * the refresh flow described in docs/SECURITY.md instead.
+ * Token renewal lives in the refresh flow: POST /v1/auth/refresh rotates an
+ * opaque refresh token (see auth/refresh-token.service.ts and
+ * docs/SECURITY.md "Refresh Tokens"). Logout revokes the refresh session
+ * server-side, but cannot invalidate an already-issued access JWT. Never extend
+ * access-token lifetime as a UX fix — the refresh flow handles renewal.
  */
 @Injectable()
 export class JwtAuthGuard implements CanActivate {
