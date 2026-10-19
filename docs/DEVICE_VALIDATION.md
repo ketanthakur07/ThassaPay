@@ -173,3 +173,101 @@ Quality gates at this checkpoint: typecheck/lint/build exit 0, **270** unit
 tests pass (197 API + 63 mobile + 5 + 5), live backend integration 88/88 —
 all backend/mocked evidence, no device evidence. Requirement status: Tests A–E
 remain BLOCKED pending an attached Android device.
+
+---
+
+## 7. Android environment bring-up — 2026-10-19 (emulator ✓, Expo Go runtime BLOCKED)
+
+The Android blocker was attacked directly this session: the SDK was installed
+and an emulator was booted, so "no SDK/emulator possible" no longer applies.
+The remaining blocker moved one layer up: **Expo Go 2.31.2 (the SDK 51 build)
+crashes natively before any app UI can render** — with a deterministic,
+app-independent signature.
+
+### 7.1 What was installed / booted (outside the repo)
+
+| Component | Location | Version |
+| --- | --- | --- |
+| Android cmdline-tools | `%LOCALAPPDATA%\Android\Sdk\cmdline-tools\12.0` | 12.0 |
+| platform-tools (adb) | `%LOCALAPPDATA%\Android\Sdk\platform-tools` | 35.0.2 |
+| Emulator + system image | `%LOCALAPPDATA%\Android\Sdk` | API 34 (Android 14), x86_64 |
+| AVD | `emulator-5554`, WHPX hardware acceleration | boots headless in ~60s |
+| Expo Go | installed on the AVD from `expo.dev/go` | `Exponent-2.31.2.apk` (SDK 51) |
+
+`adb reverse tcp:8081 tcp:8081` + `adb reverse tcp:3000 tcp:3000` wire the
+emulator to Metro and the local API — no LAN/firewall steps needed on an
+emulator.
+
+### 7.2 Blocking defect found & fixed: app could not bundle at all
+
+With the emulator ready, the app failed to bundle for a repo-layout reason
+independent of Android: with npm workspaces hoisting `expo` to the repo root,
+Expo's default entry `node_modules/expo/AppEntry.js` does
+`import App from '../../App'`, landing on `<repo>/App.tsx` — which does not
+exist (the app is `apps/mobile/App.tsx`). **The committed app could not start
+via Metro in this monorepo.**
+
+Fix (committed on this branch): explicit entry `apps/mobile/index.js`
+(`registerRootComponent(App)` from `./App`) + `"main": "index.js"` in
+`apps/mobile/package.json`. Verified: Metro serves the launch asset
+`GET /index.bundle?platform=android` → **HTTP 200, 691 modules, 6.2 MB**, with
+`RootNavigator`/`AuthContext`/`saveSecure` present. Expo SDK 51's built-in
+monorepo resolution handles `node_modules` — no custom `metro.config.js` is
+needed; none is committed.
+
+### 7.3 The remaining blocker: Expo Go 2.31.2 native crash (deterministic)
+
+With Metro + API up and the REAL app bundled through the committed entry,
+Expo Go loads the manifest, starts Hermes, runs the bundle — then dies before
+first paint. 4/4 launches, identical signature (logcat, sanitized):
+
+```
+E ReactNativeJS: Error: Exception in HostObject::get for prop 'UIManager':
+                  java.lang.NullPointerException, js engine: hermes
+E … ClassNotFoundException: com.facebook.react.devsupport.DevLoadingViewController
+W … Runtime exception in RNObject when calling method setDevLoadingEnabled:
+                  java.lang.NullPointerException
+E UIManagerHelper: ReactNoCrashSoftException: Cannot get UIManager because the
+                  context doesn't contain an active CatalystInstance.
+  … ReactInstanceManager.attachRootViewToInstance
+  … ReactRootView.onMeasure
+E AndroidRuntime: FATAL EXCEPTION: main
+  java.lang.IllegalStateException: Unable to attach a rootView to ReactInstance
+  when UIManager is not properly initialized.
+```
+
+Bisect to prove it is NOT app logic: the entry was temporarily swapped for a
+minimal RN-only probe (`<View><Text>PROBE_OK</Text></View>`, zero app modules)
+— **same crash, same signature**. The bundle itself is healthy (HTTP 200,
+644 modules for the probe; 691 for the real app). The failure is inside
+Expo Go's host runtime: the CatalystInstance never becomes active, the
+UIManager host object throws NPE on first access, root-view attach fails.
+
+Corroboration: an independent project (Oct 2026) hit the identical
+`MainApplication cannot be cast to ReactApplication` / UIManager-init crash on
+SDK 51 + Expo Go on a *physical* device and classified it as "an Expo Go
+SDK 51 runtime failure, not an app-logic bug"; their fix was upgrading the app
+to SDK 57 — an SDK upgrade is explicitly out of scope here ("do not rebuild
+the project from scratch").
+
+### 7.4 Status of Tests A–E
+
+Still **BLOCKED** — not for lack of a device (the AVD is a working Android 14
+device), but because the only SDK-51-compatible runner (Expo Go 2.31.2)
+crashes natively before any app screen renders, and the crash reproduces with
+a bare React Native tree.
+
+**Unblock paths (in order of preference):**
+
+1. **Dev build instead of Expo Go** — `npx expo prebuild` +
+   `gradle assembleDebug` (or an EAS build with an Expo account), install the
+   debug APK on the AVD. The crash is in Expo Go's host code; a self-built
+   app links its own React Native, sidestepping it. This is native-toolchain
+   work (~10+ min Gradle + SDK licenses) and was the timeboxed cut-off.
+2. **Physical device with Expo Go 51.0.x** — if the crash is specific to
+   Expo Go's x86_64 build on API 34, an ARM device may behave differently
+   (the external corroboration suggests it will not).
+3. **SDK upgrade to a supported line** — out of scope for validation.
+
+No production-readiness claim is made. Everything above is environment
+evidence; Tests A–E still have no device evidence rows.
